@@ -103,6 +103,7 @@ RPA_ESPERA_MAX = obtener_decimal("RPA_ESPERA_MAX", 30)
 RUTA_DB_SQLITE = ruta_proyecto(obtener_variable_opcional("DB_PATH"), "temporales/scraper.db")
 EXCEL_ENTRADA = ruta_proyecto(obtener_variable_opcional("EXCEL_ENTRADA"), "input/productos.xlsx")
 LISTA_DISTRIBUCION_CORREO = os.getenv("LISTA_DISTRIBUCION_CORREO", "")
+LISTA_DISTRIBUCION_ERROR = os.getenv("LISTA_DISTRIBUCION_ERROR", "")
 EXCEL_SALIDA = ruta_proyecto(obtener_variable_opcional("EXCEL_SALIDA"),"reportes/resultados.xlsx")
 CARPETA_CAPTURAS = ruta_proyecto(obtener_variable_opcional("CARPETA_CAPTURAS"), "procesados/capturas")
 ARCHIVO_SUPERMERCADOS = RUTA_CONFIG/"supermercados.json"
@@ -227,5 +228,6 @@ def configuracion_inicial():
     logger.info("CONFIGURACIÓN INICIAL FINALIZADA CORRECTAMENTE")
     return id_ejecucion
 
-MODULO_CORREO_INICIAL = obtener_booleano("MODULO_CORREO_INICIAL", False)
+MODULO_CORREO = obtener_booleano("MODULO_CORREO", True)
+MODULO_CORREO_INICIAL = obtener_booleano("MODULO_CORREO_INICIAL", True)
 MODULO_SCRAPING = obtener_booleano("MODULO_SCRAPING", True)

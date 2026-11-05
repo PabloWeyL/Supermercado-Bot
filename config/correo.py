@@ -5,10 +5,25 @@ from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 
-from config.configuracion import EXCEL_SALIDA,NOMBRE_PROCESO_TEXTO, obtener_logger, obtener_variable_opcional, LISTA_DISTRIBUCION_CORREO
+from config import configuracion
+from config.configuracion import EXCEL_SALIDA, NOMBRE_PROCESO_TEXTO, obtener_logger, obtener_variable_opcional
 
 def _destinatarios(valor):
-    return list(dict.fromkeys(correo for correo in re.split(r"[,;\s]+", valor or "") if correo))
+    salida, vistos = [], set()
+    for correo in re.split(r"[,;\s]+", valor or ""):
+        if correo and correo.casefold() not in vistos:
+            salida.append(correo)
+            vistos.add(correo.casefold())
+    return salida
+
+
+def destinatarios_evento(evento):
+    """Ambas listas reciben inicio y resultados; solo operaciones recibe fallas."""
+    if evento == 'error':
+        return _destinatarios(configuracion.LISTA_DISTRIBUCION_ERROR)
+    if evento in ('inicio', 'resultados'):
+        return _destinatarios(configuracion.LISTA_DISTRIBUCION_ERROR + ',' + configuracion.LISTA_DISTRIBUCION_CORREO)
+    raise ValueError('Evento de correo desconocido: ' + str(evento))
 
 def _adjuntar(mensaje, rutas):
     for ruta in rutas or []:
@@ -22,12 +37,14 @@ def _adjuntar(mensaje, rutas):
 
 def enviar_email(titulo, texto, destinatarios=None, adjuntos=None):
     logger = obtener_logger("CORREO")
+    if not configuracion.MODULO_CORREO:
+        return False
     remitente = obtener_variable_opcional("email_remitente", "")
     password = obtener_variable_opcional("email_password", "").replace(" ", "")
     if destinatarios is None:
-        destinatarios = _destinatarios(obtener_variable_opcional("lista_distribucion_correo", ""))
+        destinatarios = destinatarios_evento("resultados")
     if not remitente or not destinatarios:
-        logger.warning("Email: faltan email_remitente o lista_distribucion_correo en el .env")
+        logger.warning("Email: faltan remitente o destinatarios para el evento")
         return False
 
     mensaje = MIMEMultipart()
@@ -53,23 +70,31 @@ def enviar_email(titulo, texto, destinatarios=None, adjuntos=None):
         logger.error("Error enviando email: " + str(error))
         return False
 
-def notificar(titulo,texto, adjuntos=None):
+def notificar(titulo, texto, adjuntos=None, evento="resultados"):
+    if not configuracion.MODULO_CORREO:
+        return False
     try:
-        enviar_email(titulo, texto, _destinatarios(LISTA_DISTRIBUCION_CORREO), adjuntos)
+        destinatarios = destinatarios_evento(evento)
+        if not destinatarios:
+            obtener_logger("CORREO").warning("Correo %s omitido: lista de destinatarios vacia", evento)
+            return False
+        return enviar_email(titulo, texto, destinatarios, adjuntos)
     except Exception:
-        obtener_logger("CORREO").info(
-            "Correo con credenciales erroneas, en el .env si todo esta ok"
-        )
+        obtener_logger("CORREO").exception("Fallo de correo %s; el procesamiento continua", evento)
+        return False
+
 
 def enviar_correo_inicial():
+    if not configuracion.MODULO_CORREO_INICIAL or not configuracion.MODULO_CORREO:
+        return False
     logger = obtener_logger("CORREO")
     logger.info("Enviando correo inicial")
-    notificar(NOMBRE_PROCESO_TEXTO, "El proceso " + NOMBRE_PROCESO_TEXTO + " ha iniciado.")
+    return notificar(NOMBRE_PROCESO_TEXTO + " - INICIO", "El proceso " + NOMBRE_PROCESO_TEXTO + " ha iniciado.", evento="inicio")
 
 def enviar_correo_error(mensaje, adjuntos=None):
     logger = obtener_logger("CORREO")
     logger.info("Enviando correo por error")
-    notificar(NOMBRE_PROCESO_TEXTO + " - ERROR", "El proceso ha fallado:\n\n" + str(mensaje), adjuntos)
+    return notificar(NOMBRE_PROCESO_TEXTO + " - ERROR", "El proceso ha fallado:\n\n" + str(mensaje), adjuntos, evento="error")
 
 def notificar_resultado_procesamiento(resumen, titulo="Resumen de scraping", mensaje=None):
     if not resumen:
@@ -92,4 +117,4 @@ def notificar_resultado_procesamiento(resumen, titulo="Resumen de scraping", men
     adjuntos.extend(capturas)
     if capturas:
         texto += "\n\nCapturas de error adjuntas: " + str(len(capturas))
-    notificar(titulo, texto, adjuntos)
+    return notificar(titulo, texto, adjuntos, evento="resultados")

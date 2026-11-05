@@ -17,7 +17,7 @@ hacer todas las búsquedas manualmente.
 3. **Abre o reutiliza Chrome.** Usa una ventana reservada para el robot.
 4. **Busca cada producto.** Puede agregar una marca y filtrar por precio mínimo o máximo.
 5. **Lee los resultados.** Guarda hasta cinco coincidencias válidas por producto y supermercado.
-6. **Entrega el reporte.** Genera el Excel y, si el correo está configurado, envía el resumen.
+6. **Entrega el reporte.** Genera el Excel y, si el correo está configurado, envía el resumen. El aviso de inicio se envía antes de cargar las tareas.
 
 La **cola** es esa lista de tareas pendientes. SQLite es el archivo de base de
 datos donde se conservan las tareas y los resultados para poder consultarlos después.
@@ -77,6 +77,23 @@ Node.js 22 o posterior disponible en `PATH` y la configuración `.env` existente
 .\.venv\Scripts\python.exe main.py
 ```
 
+También puedes usar `ejecutar.bat`, que utiliza el entorno virtual del proyecto
+y se puede lanzar desde otra carpeta:
+
+```powershell
+.\ejecutar.bat            # Flujo completo
+.\ejecutar.bat procesar   # Flujo completo
+.\ejecutar.bat cargar     # Cargar los Excel
+.\ejecutar.bat estado     # Consultar la cola
+.\ejecutar.bat reporte    # Generar el reporte
+.\ejecutar.bat --help     # Mostrar la ayuda
+```
+
+El archivo también puede abrirse con doble clic. La ventana se cierra al terminar;
+puedes revisar el resultado en los logs y reportes. No incluye una pausa para
+permitir su uso con el Programador de tareas de Windows. Devuelve el mismo código
+de salida que Python y muestra un error si falta `.venv`.
+
 Los comandos disponibles son:
 
 ```powershell
@@ -95,8 +112,9 @@ El flujo completo tiene un solo coordinador en `integraciones/robot.py`.
 `main.py` interpreta argumentos y convierte el resultado del coordinador en un
 codigo de salida. Los reintentos de productos pertenecen al scraper; un fallo
 posterior al scraping, como no poder escribir Excel, no repite toda la busqueda.
-Se envia una sola notificacion final, con el resumen de tareas y los archivos
-de entrada rechazados. Un fallo de correo se registra sin repetir el scraping.
+Se envia un aviso de inicio y una sola notificacion final con el resumen de tareas
+y los archivos de entrada rechazados. Una falla critica genera un aviso de error.
+Un fallo de correo se registra sin repetir el scraping.
 
 Importar `config.configuracion` lee valores, pero no crea ni migra SQLite.
 La inicializacion ocurre al llamar explicitamente a `configuracion_inicial()`.
@@ -104,6 +122,29 @@ Las llamadas Python directas a funciones de persistencia deben inicializarla
 primero, o configurar una base con `configurar_base_datos(ruta)`.
 `config.excel` conserva alias compatibles del lector y la plantilla de
 `integraciones.productos`, que es la unica implementacion de ese formato.
+
+### Correos de inicio, resultados y fallas
+
+| Aviso | LISTA_DISTRIBUCION_ERROR | LISTA_DISTRIBUCION_CORREO |
+|---|---|---|
+| Inicio del flujo | Sí | Sí |
+| Resultados, incluidos resultados con errores por producto | Sí | Sí |
+| Falla que interrumpe el flujo | Sí | No |
+
+Las listas se configuran en `.env`. Aceptan comas, punto y coma o espacios.
+Una dirección presente en ambas recibe una sola copia de cada aviso de inicio
+o resultados. Las fallas se envían exclusivamente a `LISTA_DISTRIBUCION_ERROR`;
+si esa lista está vacía, no se sustituyen sus destinatarios por la otra lista.
+
+`MODULO_CORREO=true` habilita los avisos. `MODULO_CORREO_INICIAL=true` habilita
+el de inicio; en `false` se omite solamente ese aviso. Los dos valores son
+`true` por defecto para mantener el envío del flujo configurado. Si
+`MODULO_SCRAPING=false`, no se inicia el flujo ni se envían sus avisos.
+Los comandos auxiliares `cargar`, `estado` y `reporte` no envían estos correos.
+
+Se conserva el remitente y las listas privadas existentes. No se envían avisos
+intermedios de avance. Los errores de SMTP se registran y no cambian el resultado
+del procesamiento; las pruebas usan correo simulado.
 
 ### Ventana persistente del robot
 

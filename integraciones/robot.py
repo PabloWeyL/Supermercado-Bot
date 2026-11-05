@@ -1,6 +1,6 @@
 """Coordinador del flujo de precios; la CLI y las llamadas Python lo comparten."""
 from config import configuracion
-from config.correo import enviar_correo_error, notificar_resultado_procesamiento
+from config.correo import enviar_correo_inicial, enviar_correo_error, notificar_resultado_procesamiento
 from integraciones.cola import cargar_excel_a_tabla_cola
 from integraciones.reportes import generar_resultados_excel
 from integraciones.scraping import procesar_cola_a_resultados, obtener_capturas
@@ -17,6 +17,8 @@ def ejecutar_todo(titulo="Resumen de scraping", mensaje=None):
     try:
         configuracion.configuracion_inicial()
         logger.info('INICIO DEL PROCESO')
+        if configuracion.MODULO_CORREO and configuracion.MODULO_CORREO_INICIAL:
+            enviar_correo_inicial()
         carga = cargar_excel_a_tabla_cola()
         resumen = procesar_cola_a_resultados() or {'ok': 0, 'errores': 0, 'fallos': [], 'capturas': []}
         resumen = dict(resumen, carga=carga)

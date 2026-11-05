@@ -753,6 +753,9 @@ class CoordinacionTests(unittest.TestCase):
         stack = ExitStack()
         self.addCleanup(stack.close)
         stack.enter_context(patch.object(configuracion, 'MODULO_SCRAPING', True))
+        stack.enter_context(patch.object(configuracion, 'MODULO_CORREO', True))
+        stack.enter_context(patch.object(configuracion, 'MODULO_CORREO_INICIAL', True))
+        self.aviso_inicio = stack.enter_context(patch.object(robot, 'enviar_correo_inicial'))
         self.iniciar = stack.enter_context(patch.object(configuracion, 'configuracion_inicial'))
         self.logger = stack.enter_context(patch.object(configuracion, 'obtener_logger'))
         self.cargar = stack.enter_context(patch.object(robot, 'cargar_excel_a_tabla_cola', return_value={'archivos_leidos': 1, 'archivos_error': 0}))
@@ -767,7 +770,7 @@ class CoordinacionTests(unittest.TestCase):
             self.assertEqual(self.main.main([]), 0)
             self.assertEqual(self.main.main(['cargar']), 0)
             self.assertEqual(self.robot.ejecutar_todo()['estado'], 'desactivado')
-        for accion in (self.iniciar, self.cargar, self.procesar, self.reporte, self.notificar, self.error):
+        for accion in (self.iniciar, self.cargar, self.procesar, self.reporte, self.notificar, self.error, self.aviso_inicio):
             accion.assert_not_called()
 
     def test_predeterminado_y_procesar_comparten_coordinador(self):
@@ -775,6 +778,7 @@ class CoordinacionTests(unittest.TestCase):
             self.assertEqual(self.main.main(args), 0)
         self.assertEqual(self.procesar.call_count, 2)
         self.assertEqual(self.notificar.call_count, 2)
+        self.assertEqual(self.aviso_inicio.call_count, 2)
 
     def test_tareas_fallidas_salen_con_error_sin_repetir_pipeline(self):
         self.procesar.return_value = {'ok': 1, 'errores': 1}
@@ -850,6 +854,84 @@ assert base_datos._ruta_db is None
             resultado = subprocess.run([sys.executable, '-B', '-c', codigo], cwd=ROOT, env=env,
                                        capture_output=True, text=True, timeout=20)
             self.assertEqual(resultado.returncode, 0, resultado.stderr)
+
+
+class CorreosTests(unittest.TestCase):
+    def setUp(self):
+        from contextlib import ExitStack
+        from config import configuracion, correo
+        self.config, self.correo = configuracion, correo
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(patch.object(configuracion, 'MODULO_CORREO', True))
+        stack.enter_context(patch.object(configuracion, 'MODULO_CORREO_INICIAL', True))
+        stack.enter_context(patch.object(configuracion, 'LISTA_DISTRIBUCION_ERROR', 'operacion@example.test;comun@example.test'))
+        stack.enter_context(patch.object(configuracion, 'LISTA_DISTRIBUCION_CORREO', 'resultados@example.test,COMUN@example.test'))
+        self.enviar = stack.enter_context(patch.object(correo, 'enviar_email', return_value=True))
+        stack.enter_context(patch.object(correo, 'EXCEL_SALIDA', str(ROOT / 'tests/no_existe.xlsx')))
+
+    def test_inicio_ambas_listas_sin_duplicados(self):
+        self.assertTrue(self.correo.enviar_correo_inicial())
+        self.assertEqual(self.enviar.call_args.args[2], ['operacion@example.test', 'comun@example.test', 'resultados@example.test'])
+
+    def test_falla_solo_lista_error(self):
+        self.assertTrue(self.correo.enviar_correo_error('Fallo simulado'))
+        self.assertEqual(self.enviar.call_args.args[2], ['operacion@example.test', 'comun@example.test'])
+
+    def test_resultados_ambas_listas_sin_duplicados(self):
+        self.assertTrue(self.correo.notificar_resultado_procesamiento({'ok': 2, 'errores': 1, 'fallos': []}))
+        self.assertEqual(self.enviar.call_args.args[2], ['operacion@example.test', 'comun@example.test', 'resultados@example.test'])
+
+    def test_inicio_desactivado_y_todo_desactivado(self):
+        with patch.object(self.config, 'MODULO_CORREO_INICIAL', False):
+            self.assertFalse(self.correo.enviar_correo_inicial())
+        self.enviar.assert_not_called()
+        with patch.object(self.config, 'MODULO_CORREO', False):
+            self.correo.enviar_correo_inicial()
+            self.correo.enviar_correo_error('Fallo')
+            self.correo.notificar_resultado_procesamiento({'ok': 1, 'errores': 0})
+        self.enviar.assert_not_called()
+
+    def test_lista_error_vacia_inicio_llega_a_correo_pero_falla_no(self):
+        with patch.object(self.config, 'LISTA_DISTRIBUCION_ERROR', ''):
+            self.assertTrue(self.correo.enviar_correo_inicial())
+            self.assertEqual(self.enviar.call_args.args[2], ['resultados@example.test', 'COMUN@example.test'])
+            self.enviar.reset_mock()
+            self.assertFalse(self.correo.enviar_correo_error('Fallo'))
+            self.enviar.assert_not_called()
+            self.correo.notificar_resultado_procesamiento({'ok': 1, 'errores': 0})
+        self.assertEqual(self.enviar.call_args.args[2], ['resultados@example.test', 'COMUN@example.test'])
+
+    def test_fallo_de_envio_no_interrumpe_notificacion_posterior(self):
+        self.enviar.side_effect = [OSError('SMTP no disponible'), True]
+        self.assertFalse(self.correo.enviar_correo_inicial())
+        self.assertTrue(self.correo.notificar_resultado_procesamiento({'ok': 1, 'errores': 0}))
+        self.assertEqual(self.enviar.call_count, 2)
+
+    def test_coordinador_envia_inicio_antes_de_cargar_y_resultados_al_final(self):
+        from integraciones import robot
+        eventos = []
+        with patch.object(self.config, 'MODULO_SCRAPING', True), patch.object(self.config, 'configuracion_inicial'), \
+             patch.object(robot, 'cargar_excel_a_tabla_cola', side_effect=lambda: eventos.append('carga') or {'archivos_error': 0}), \
+             patch.object(robot, 'procesar_cola_a_resultados', return_value={'ok': 1, 'errores': 0}), \
+             patch.object(robot, 'generar_resultados_excel'):
+            self.enviar.side_effect = lambda titulo, texto, destinatarios, adjuntos: eventos.append('inicio' if 'INICIO' in titulo else 'resultados') or True
+            resumen = robot.ejecutar_todo()
+        self.assertEqual(resumen['estado'], 'completado')
+        self.assertEqual(eventos, ['inicio', 'carga', 'resultados'])
+        self.assertEqual(self.enviar.call_args_list[0].args[2], ['operacion@example.test', 'comun@example.test', 'resultados@example.test'])
+        self.assertEqual(self.enviar.call_args_list[1].args[2], ['operacion@example.test', 'comun@example.test', 'resultados@example.test'])
+
+    def test_coordinador_falla_no_envia_aviso_de_falla_a_lista_resultados(self):
+        from integraciones import robot
+        with patch.object(self.config, 'MODULO_SCRAPING', True), patch.object(self.config, 'configuracion_inicial'), \
+             patch.object(robot, 'cargar_excel_a_tabla_cola', side_effect=OSError('Entrada inaccesible')), \
+             patch.object(robot, 'obtener_capturas', return_value=[]):
+            resumen = robot.ejecutar_todo()
+        self.assertEqual(resumen['estado'], 'error')
+        self.assertEqual(self.enviar.call_count, 2)
+        self.assertEqual(self.enviar.call_args_list[0].args[2], ['operacion@example.test', 'comun@example.test', 'resultados@example.test'])
+        self.assertEqual(self.enviar.call_args_list[1].args[2], ['operacion@example.test', 'comun@example.test'])
 
 
 if __name__ == "__main__":

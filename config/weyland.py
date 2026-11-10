@@ -21,6 +21,8 @@ def crear_cliente_weyland(archivo=None, session=None, credenciales=None, valores
     if credenciales is not None:
         credenciales = normalizar_credenciales({**{k: valores.get(k) for k in IDENTIDAD}, **credenciales})
     contrato = str(valores.get('BACKEND_CONTRATO') or 'por_id').strip().lower()
+    if valores.get('BACKEND_AUTH_MODE') == 'api_key' and contrato != 'cola_actual':
+        raise ValueError('El modo api_key requiere BACKEND_CONTRATO=cola_actual')
     if contrato == 'cola_actual':
         from integraciones.weyland.cola_actual import crear_cliente_cola
         return crear_cliente_cola(valores, credenciales, session)

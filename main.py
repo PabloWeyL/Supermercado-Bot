@@ -4,6 +4,7 @@ from pathlib import Path
 
 _ERROR_CARGA = None
 try:
+    from integraciones.diagnostico import diagnosticar_error, diagnosticar_correos
     from config import configuracion
     from integraciones import robot
     from integraciones.cola import cargar_excel_a_tabla_cola, ver_datos_en_tabla_cola
@@ -63,8 +64,8 @@ def main(argv=None):
     if args.id_solicitud is not None and args.comando != 'web-procesar':
         parser.error('--id-solicitud solo se admite con web-procesar')
     if _ERROR_CARGA is not None:
-        print(f'ERROR: no se pudo cargar la configuracion o las dependencias: {_ERROR_CARGA}')
-        return 1
+        print('[CONFIGURACION_INVALIDA] No se pudo cargar la configuracion o las dependencias. Revisar .env e instalacion (salida 2)')
+        return 2
     if args.comando in ('procesar', 'cargar') and not configuracion.MODULO_SCRAPING:
         print('MODULO_SCRAPING=false: automatizacion desactivada')
         return 0
@@ -85,8 +86,14 @@ def main(argv=None):
                 if not configuracion.MODULO_CORREO:
                     raise ValueError('MODULO_CORREO=false: no se reenviaran correos')
                 if args.id_correo:
+                    if not cola.resumen(solo=args.id_correo):
+                        raise ValueError('No existe el correo seleccionado en la cola')
                     cola.reactivar(args.id_correo)
-                print('Estado de correos:', reintentar_pendientes())
+                resumen = reintentar_pendientes(solo=args.id_correo, propagar_error=True)
+                print('Estado de correos:', resumen)
+                diagnostico = diagnosticar_correos(resumen)
+                print(diagnostico.texto())
+                return diagnostico.codigo
             return 0
         if args.comando == 'web-procesar':
             if not configuracion.MODULO_SCRAPING:
@@ -128,9 +135,10 @@ def main(argv=None):
         return 0
     except Exception as error:
         from integraciones.trazabilidad import contexto
+        diagnostico = diagnosticar_error(error, correo=args.comando.startswith('correos-'))
         with contexto(getattr(error, 'contexto_trazabilidad', None)):
-            configuracion.obtener_logger('CLI').error('Error: %s', error)
-        return 1
+            configuracion.obtener_logger('CLI').error(diagnostico.texto())
+        return diagnostico.codigo
 
 
 if __name__ == '__main__':

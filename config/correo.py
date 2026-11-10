@@ -99,7 +99,12 @@ def _encolar_y_enviar(titulo, texto, destinatarios, adjuntos):
     cola.registrar(identificador, remitente, destinatarios, mensaje.as_bytes(), datos_contexto)
     cola.procesar(_enviar_preparado, solo=identificador)
     aceptado = cola.entregado(identificador)
-    logger.info('Correo %s: %s', identificador, 'ACEPTADO_SMTP' if aceptado else 'PENDIENTE_O_REQUIERE_REVISION')
+    if aceptado:
+        logger.info('Correo %s: ACEPTADO_SMTP', identificador)
+    else:
+        logger.warning('CORREO_PENDIENTE %s: mensaje y adjuntos conservados en la cola. '
+                       'Revisar con correos-estado; recuperar con correos-reintentar. '
+                       'No repetir el proceso ni la entrega web por este fallo.', identificador)
     return aceptado
 
 
@@ -142,13 +147,20 @@ def _enviar_preparado(remitente, destinatarios, mime):
                     pass
 
 
-def reintentar_pendientes():
+def reintentar_pendientes(*, solo=None, propagar_error=False):
+    """Reenvia el MIME conservado; no consulta la web ni invoca el negocio.
+
+    solo limita envio y resumen al mensaje seleccionado. Los destinatarios
+    INCIERTO requieren resolucion manual; nunca los reactiva este metodo.
+    """
     if not configuracion.MODULO_CORREO:
         return {}
     try:
-        return obtener_cola().procesar(_enviar_preparado)
+        return obtener_cola().procesar(_enviar_preparado, solo=solo)
     except Exception:
         obtener_logger('CORREO').error('No se pudo revisar la cola de correos; el negocio no se repetira por este fallo')
+        if propagar_error:
+            raise
         return {}
 
 def notificar(titulo, texto, adjuntos=None, evento="resultados"):

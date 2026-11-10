@@ -24,7 +24,8 @@ def _ejecutar(titulo, mensaje, productos_json, *, configurado=False):
     try:
         if not configurado:
             configuracion.configuracion_inicial()
-        reintentar_pendientes()
+        if not correo_del_coordinador:
+            reintentar_pendientes()
         logger.info('INICIO DEL PROCESO')
         if configuracion.MODULO_CORREO and configuracion.MODULO_CORREO_INICIAL and not correo_del_coordinador:
             enviar_correo_inicial()

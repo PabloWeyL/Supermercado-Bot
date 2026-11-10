@@ -27,16 +27,22 @@ class ConfiguracionWeyland:
     permitir_http_local: bool = False
     timeout_conexion: float = 10
     timeout_lectura: float = 60
+    solo_api_key: bool = False
 
     def __post_init__(self):
         for nombre in ('timeout_conexion', 'timeout_lectura'):
             valor = getattr(self, nombre)
             if isinstance(valor, bool) or not isinstance(valor, (int, float)) or not math.isfinite(valor) or valor <= 0:
                 raise ValueError(nombre + ' debe ser un numero finito positivo')
-        if validar_url(self.url, self.permitir_http_local) != validar_url(self.login_url, self.permitir_http_local):
+        if type(self.solo_api_key) is not bool:
+            raise ValueError('solo_api_key debe ser booleano')
+        origen = validar_url(self.url, self.permitir_http_local)
+        if not self.solo_api_key and origen != validar_url(self.login_url, self.permitir_http_local):
             raise ValueError('Login y API de sesion deben estar en el mismo origen')
-        if not self.correo or '@' not in self.correo or not self.password:
+        if not self.solo_api_key and (not self.correo or '@' not in self.correo or not self.password):
             raise ValueError('Faltan correo y password de Weyland')
+        if self.solo_api_key and (not self.api_key or any(c.isspace() for c in self.api_key)):
+            raise ValueError('Falta una API key valida para el modo api_key')
         if any(c in self.api_key for c in '\r\n'):
             raise ValueError('API key invalida')
 
@@ -64,9 +70,10 @@ def configuracion_desde_valores(valores, credenciales=None):
         except (ValueError, TypeError):
             raise ValueError(variable + ' debe ser un numero finito positivo') from None
     url = obligatorio(valores, 'BACKEND_API_URL').rstrip('/')
+    solo_api_key = str(valores.get('BACKEND_AUTH_MODE') or 'weyland').strip().lower() == 'api_key'
     return ConfiguracionWeyland(
-        url=url, login_url=str(valores.get('BACKEND_LOGIN_URL') or url+'/auth/login').strip(),
-        correo=obligatorio(credenciales, 'BACKEND_EMAIL'),
-        password=obligatorio(credenciales, 'BACKEND_PASSWORD', preservar=True),
+        url=url, login_url='' if solo_api_key else str(valores.get('BACKEND_LOGIN_URL') or url+'/auth/login').strip(),
+        correo='' if solo_api_key else obligatorio(credenciales, 'BACKEND_EMAIL'),
+        password='' if solo_api_key else obligatorio(credenciales, 'BACKEND_PASSWORD', preservar=True),
         api_key=str(credenciales.get('BACKEND_BOT_API_KEY') or ''),
-        permitir_http_local=permitir == 'true', **tiempos)
+        permitir_http_local=permitir == 'true', solo_api_key=solo_api_key, **tiempos)

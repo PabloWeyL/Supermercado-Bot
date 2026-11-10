@@ -61,6 +61,8 @@ class SesionWeyland:
             self._csrf = token
 
     def _login(self):
+        if getattr(self.config, 'solo_api_key', False):
+            raise ErrorWeyland('El modo api_key no utiliza login ni CSRF')
         self._autenticado = False
         self._session.cookies.clear()
         self._obtener_csrf()
@@ -99,7 +101,30 @@ class SesionWeyland:
 
     def verificar(self):
         with self._lock:
-            self._perfil()
+            if getattr(self.config, 'solo_api_key', False):
+                return self._verificar_api_key()
+            return self._perfil()
+
+    def _verificar_api_key(self):
+        """GET autentica pero no puede tomar trabajo: siguiente solo admite POST.
+
+        La API valida EsBot antes de responder METODO_NO_PERMITIDO. Nunca probar
+        conectividad con POST siguiente porque ya cambiaria el estado de una orden.
+        """
+        if self._cerrado:
+            raise ErrorWeyland('Cliente cerrado')
+        self._session.cookies.clear()
+        with self._enviar('GET', '/bot/ejecuciones/siguiente',
+                headers={'X-Api-Key': self.config.api_key}) as respuesta:
+            if respuesta.status_code != 405:
+                if respuesta.status_code in (401, 403) or respuesta.status_code >= 500:
+                    raise ErrorHTTPWeyland(respuesta.status_code)
+                raise ErrorWeyland('La respuesta no confirma la autenticacion API key sin tomar trabajo')
+            datos = leer_json(respuesta)
+            error = datos.get('error')
+            if not isinstance(error, dict) or error.get('codigo') != 'METODO_NO_PERMITIDO':
+                raise ErrorWeyland('El endpoint no confirma el contrato de verificacion API key')
+        self._autenticado = True
 
     def solicitar(self, metodo, ruta, *, datos=None, archivos=None, params=None, stream=False,
                   formulario=None, empresa_id=None, clave_idempotencia=None):
@@ -127,15 +152,23 @@ class SesionWeyland:
         with self._lock:
             # El API key no caduca con la cookie. Verificar la sesion humana antes
             # de cada operacion evita continuar con una sesion vencida sin detectarlo.
-            self._perfil()
             bot = ruta.startswith('/bot/')
+            solo_api_key = getattr(self.config, 'solo_api_key', False)
+            if solo_api_key:
+                if self._cerrado:
+                    raise ErrorWeyland('Cliente cerrado')
+                if not bot:
+                    raise ErrorWeyland('La conciliacion por API de usuario requiere sesion; revisar la ejecucion manualmente')
+                self._session.cookies.clear()
+            else:
+                self._perfil()
             if bot and not self.config.api_key:
                 raise ErrorWeyland('Falta BACKEND_BOT_API_KEY para la API del bot')
             for intento in range(2):
                 headers = {'X-Api-Key': self.config.api_key} if bot else {}
                 if empresa_id is not None:
                     headers['X-Empresa-Id'] = str(empresa_id)
-                if metodo != 'GET':
+                if metodo != 'GET' and not solo_api_key:
                     headers.update({'X-CSRFToken': self._csrf, 'Referer': self.config.login_url})
                 if clave_idempotencia is not None:
                     headers['Idempotency-Key'] = clave_idempotencia
@@ -153,10 +186,10 @@ class SesionWeyland:
                     except (ValueError, AttributeError):
                         pass
                 respuesta.close()
-                if intento == 0 and codigo == 401 and (not bot or error == 'SESION_EXPIRADA'):
+                if not solo_api_key and intento == 0 and codigo == 401 and (not bot or error == 'SESION_EXPIRADA'):
                     self._login()
                     continue
-                if intento == 0 and codigo == 403 and error == 'CSRF_INVALIDO':
+                if not solo_api_key and intento == 0 and codigo == 403 and error == 'CSRF_INVALIDO':
                     self._obtener_csrf()
                     continue
                 # Una clave invalida no se corrige renovando la sesion.

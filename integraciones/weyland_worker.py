@@ -151,4 +151,7 @@ def ejecutar_contrato_actual(proyecto, raiz, comando, valores, runner=None, *, f
     proceso = ProcesoBot(procesar, None if proyecto == 'supermercados' else True, extensiones)
     resultado = ejecutar_cola_configurada(fabrica or crear_cliente_api, valores, raiz, {codigo: proceso}, notificar=notificar)
     print('Weyland Automate:', resultado['fase'], 'ID:', resultado.get('ejecucion_id', 'SIN_TRABAJO'), flush=True)
-    return 0 if resultado['fase'] == 'COMPLETADA' else 1
+    from integraciones.diagnostico import diagnosticar_resultado
+    diagnostico = diagnosticar_resultado(resultado)
+    print(diagnostico.texto(), flush=True)
+    return diagnostico.codigo

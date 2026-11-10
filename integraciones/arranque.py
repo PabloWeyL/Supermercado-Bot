@@ -167,7 +167,8 @@ def ejecutar_automatico(proceso, *, remoto=False):
         config.configuracion_inicial()
         revisar_base_operativa(config)
         from config.correo import reintentar_pendientes
-        reintentar_pendientes()
+        if not remoto:
+            reintentar_pendientes()
         if remoto:
             print('[3/4] Entradas controladas por la solicitud web; no se cargara la cola local', flush=True)
         else:

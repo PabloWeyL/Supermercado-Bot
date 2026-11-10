@@ -8,7 +8,7 @@ from integraciones.api_http import ClienteAPI, ConfiguracionAPI
 def crear_cliente_api(archivo=None, session=None):
     archivo = Path(archivo) if archivo else Path(__file__).resolve().parents[1] / '.env'
     valores = leer_valores(archivo)
-    if valores.get('BACKEND_AUTH_MODE') == 'weyland':
+    if valores.get('BACKEND_AUTH_MODE') in ('weyland', 'api_key'):
         from config.weyland import crear_cliente_weyland
         return crear_cliente_weyland(archivo, session, valores=valores)
 

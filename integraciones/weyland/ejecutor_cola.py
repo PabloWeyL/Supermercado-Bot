@@ -40,8 +40,9 @@ def _leer(ruta):
 
 
 def _identidad(cliente, maquina_id, procesos):
+    cuenta = 'bot_api_key' if getattr(cliente.config, 'solo_api_key', False) else cliente.config.correo.casefold()
     return {'version': 1, 'contrato': 'cola_actual', 'backend': cliente.config.url,
-            'cuenta_sha256': hashlib.sha256(cliente.config.correo.casefold().encode()).hexdigest(),
+            'cuenta_sha256': hashlib.sha256(cuenta.encode()).hexdigest(),
             'maquina_id': maquina_id, 'codigos': sorted(procesos)}
 
 
@@ -52,6 +53,7 @@ def _contexto_de_error():
         yield referencia
     except Exception as error:
         estado = referencia.get('estado') or {}
+        error.fase_weyland = estado.get('fase')
         if estado.get('id_externo') and not hasattr(error, 'contexto_trazabilidad'):
             error.contexto_trazabilidad = {'solicitud_id': estado.get('ejecucion_id'),
                 'ejecucion_id_web': estado.get('ejecucion_id'), 'activacion_id': estado['id_externo']}
@@ -70,8 +72,22 @@ def _validar_estado(estado, identidad):
             raise ErrorWeyland('IDs incompatibles en el checkpoint')
 
 
+def correo_permitido(estado):
+    """La politica de correo se congela al tomar el trabajo, incluidos reintentos.
+
+    Un journal anterior sin la bandera no demuestra autorizacion web: no enviar
+    automaticamente sus correos. None explicito significa que la web delega
+    en la configuracion local. La entrega del resultado web nunca depende de esto.
+    """
+    trabajo = estado.get('trabajo')
+    if not isinstance(trabajo, dict):
+        return False
+    valor = trabajo.get('notificar_correo', False)
+    return valor is None or valor is True
+
+
 def _avisar(notificar, evento, estado, carpeta):
-    if notificar is not None:
+    if notificar is not None and correo_permitido(estado):
         try:
             notificar(evento, dict(estado), carpeta)
         except Exception:
@@ -126,6 +142,9 @@ def _recuperar_toma(cliente, estado):
         raise ErrorWeyland('Inputs ambiguos al recuperar una toma')
     identificador = id_positivo(detalle.get('id'))
     return {'ejecucion_id': identificador, 'id_externo': detalle.get('id_externo'),
+            # El detalle de usuario no devuelve la configuracion de habilitacion.
+            # Sin prueba de esa politica no enviar correos, aunque el negocio retome.
+            'configuracion': {'notificar_correo': False},
             'maquina': detalle.get('maquina'), 'proceso': detalle.get('proceso'),
             'parametros': detalle.get('parametros'),
             'input': {'nombre': entradas[0].get('nombre'),
@@ -218,9 +237,9 @@ def ejecutar_cola(cliente, maquina_id, trabajos, procesos, *, notificar=None):
             except ErrorHTTPWeyland as error:
                 if error.status_code in (408, 429) or error.status_code >= 500:
                     raise
-                estado.update(fase='ERROR_LISTO', mensaje_error='No se pudo obtener un input valido para la ejecucion.')
+                estado.update(fase='ERROR_LISTO', etapa_error='input', mensaje_error='No se pudo obtener un input valido para la ejecucion.')
             except (ValueError, ErrorWeyland):
-                estado.update(fase='ERROR_LISTO', mensaje_error='La entrada de la ejecucion es incompatible o invalida.')
+                estado.update(fase='ERROR_LISTO', etapa_error='input', mensaje_error='La entrada de la ejecucion es incompatible o invalida.')
             guardar_json(journal, estado)
         if estado['fase'] == 'PREPARADO':
             estado['fase'] = 'EJECUTANDO'
@@ -233,7 +252,7 @@ def ejecutar_cola(cliente, maquina_id, trabajos, procesos, *, notificar=None):
                 resultado = proceso.ejecutar(carpeta, entrada, estado['trabajo']['parametros'])
                 estado.update(resultado=snapshot_resultado(carpeta, resultado), fase='EXPORT_PENDIENTE')
             except Exception:
-                estado.update(fase='ERROR_LISTO', mensaje_error='El proceso no pudo completarse; revisar su evidencia privada.')
+                estado.update(fase='ERROR_LISTO', etapa_error='procesamiento', mensaje_error='El proceso no pudo completarse; revisar su evidencia privada.')
             guardar_json(journal, estado)
         if estado['fase'] == 'EXPORT_PENDIENTE':
             estado.update(entrega=empaquetar_resultado(carpeta, estado), fase='ENTREGA_LISTA')

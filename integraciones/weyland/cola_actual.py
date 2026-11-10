@@ -25,6 +25,24 @@ def entero_configurado(valores, nombre, defecto=None):
     return int(valor)
 
 
+def leer_notificar_correo(configuracion):
+    """Booleano web opcional. None conserva el interruptor local del bot.
+
+    Se extrae solo esta bandera: nunca persistir el objeto de configuracion,
+    que puede incluir datos privados propios de la empresa.
+    """
+    if configuracion is None:
+        return None
+    if not isinstance(configuracion, dict):
+        raise ErrorWeyland('La configuracion del proceso debe ser un objeto o null')
+    if 'notificar_correo' not in configuracion:
+        return None
+    valor = configuracion['notificar_correo']
+    if type(valor) is not bool:
+        raise ErrorWeyland('configuracion.notificar_correo debe ser true o false JSON')
+    return valor
+
+
 def validar_datos_publicables(datos, profundidad=0):
     """Evita persistir credenciales accidentales en parámetros o manifiestos."""
     if profundidad > 32:
@@ -89,6 +107,7 @@ class ClienteColaWeyland(ClienteWeyland):
         return {'ejecucion_id': datos['ejecucion_id'], 'id_externo': id_externo,
                 'maquina_id': maquina_id, 'proceso_codigo': datos['proceso']['codigo'],
                 'parametros': datos['parametros'],
+                'notificar_correo': leer_notificar_correo(datos.get('configuracion')),
                 'input': {'nombre': entrada['nombre'], 'descarga': entrada['descarga']} if entrada else None}
 
     def _descargar(self, ruta, destino, limite, *, usuario=False):

@@ -21,8 +21,8 @@ def verificar_migracion(base):
 
 
 def ejecutar_cola_configurada(fabrica, valores, raiz, procesos, *, notificar=None):
-    if valores.get('BACKEND_CONTRATO') != 'cola_actual' or valores.get('BACKEND_AUTH_MODE') != 'weyland':
-        raise ValueError('Configurar BACKEND_CONTRATO=cola_actual y BACKEND_AUTH_MODE=weyland')
+    if valores.get('BACKEND_CONTRATO') != 'cola_actual' or valores.get('BACKEND_AUTH_MODE') not in ('weyland', 'api_key'):
+        raise ValueError('Configurar BACKEND_CONTRATO=cola_actual y BACKEND_AUTH_MODE=weyland o api_key')
     if str(valores.get('BACKEND_REUTILIZAR_ULTIMA') or 'false').lower() != 'false':
         raise ValueError('No se reutilizan solicitudes anteriores')
     maquina = entero_configurado(valores, 'BACKEND_MAQUINA_ID')

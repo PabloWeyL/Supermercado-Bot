@@ -112,12 +112,16 @@ class ColaCorreo:
                     con.executemany('UPDATE destinatarios SET estado=?,proximo=?,codigo=? WHERE mensaje_id=? AND correo=?',
                         [(estado, proximo, codigo, identificador, correo)
                          for correo, (estado, proximo, codigo) in estados.items()])
-        return self.resumen()
+        return self.resumen(solo=solo)
 
-    def resumen(self):
+    def resumen(self, *, solo=None):
         with self.conexion() as con:
-            return {f['estado']: f['cantidad'] for f in con.execute(
-                'SELECT estado,COUNT(*) AS cantidad FROM destinatarios GROUP BY estado')}
+            sql = 'SELECT estado,COUNT(*) AS cantidad FROM destinatarios'
+            args = ()
+            if solo is not None:
+                sql += ' WHERE mensaje_id=?'
+                args = (solo,)
+            return {f['estado']: f['cantidad'] for f in con.execute(sql + ' GROUP BY estado', args)}
 
     def listar(self):
         with self.conexion() as con:

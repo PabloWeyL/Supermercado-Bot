@@ -21,7 +21,7 @@ def ejecutar_web_sin_argumentos(puerta_arranque):
         from integraciones.weyland.cola_actual import entero_configurado
         valores = leer_valores()
         maquina = entero_configurado(valores, 'BACKEND_MAQUINA_ID')
-        if valores.get('BACKEND_AUTH_MODE') != 'weyland' or not valores.get('BACKEND_PROCESO_CODIGO'):
+        if valores.get('BACKEND_AUTH_MODE') not in ('weyland', 'api_key') or not valores.get('BACKEND_PROCESO_CODIGO'):
             raise ValueError('Configurar autenticacion Weyland y codigo de proceso antes del arranque')
         print(f'Contrato backend actual; consultar trabajo de la VM registrada {maquina}', flush=True)
         return puerta_arranque(lambda: ejecutar_desde_config('supermercados', configuracion.RUTA_PROYECTO), remoto=True)

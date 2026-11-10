@@ -92,9 +92,12 @@ token*.json
 *.mp3
 *.wav
 *.m4a
+*.md
+!docs/conexion_weyland_local.md
 
 # Entorno virtual, cache y archivos propios de la maquina.
 .venv/
+.runtime/
 venv/
 env/
 __pycache__/
@@ -109,3 +112,16 @@ htmlcov/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+!docs/cliente_backend_reutilizable.md
+!docs/RESUMEN_CONEXION_BACKEND.md
+!docs/flujo_solicitudes_supermercados.md
+
+!README.md
+!docs/PRUEBA_FLUJO_WEB.md
+!docs/CORREOS_TRAZABILIDAD_EXCEL.md
+
+!docs/INTEGRACION_WEYLAND_COMUN.md
+!docs/GUIA_BACKEND_ACTUAL.md
+
+!docs/ejecucion_por_solicitud.md

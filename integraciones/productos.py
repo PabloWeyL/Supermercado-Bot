@@ -3,8 +3,11 @@ from openpyxl import Workbook, load_workbook
 
 from config.configuracion import EXCEL_ENTRADA, RUTA_INPUT
 from integraciones.filtros import leer_precio, normalizar_marca
+from integraciones.productos_json import leer_productos_json
+from integraciones.seguridad_excel import validar_contenedor, texto_entrada, MAX_FILAS, MAX_COLUMNAS
 
 COLUMNAS = ("supermercado", "producto", "marca", "precio_minimo", "precio_maximo")
+
 
 def leer_productos_excel(ruta=None):
     "funcion para leer los productos de excel y procesarlos si es que hay o no"
@@ -12,12 +15,29 @@ def leer_productos_excel(ruta=None):
     if not os.path.exists(ruta):
         raise FileNotFoundError("No existe el Excel de entrada: " + ruta)
 
-    libro = load_workbook(ruta, read_only=True, data_only=True)
+    copia_validada = validar_contenedor(ruta)
+    libro = load_workbook(copia_validada, read_only=True, data_only=False, keep_links=False)
     try:
         hoja = libro.active
-        filas = list(hoja.iter_rows(values_only=True))
+        if (hoja.max_row or 0) > MAX_FILAS + 1 or (hoja.max_column or 0) > MAX_COLUMNAS:
+            raise ValueError('El Excel supera el limite de filas o columnas')
+        hoja.reset_dimensions()
+        filas = []
+        for numero, fila in enumerate(hoja.iter_rows(max_col=MAX_COLUMNAS + 1), start=1):
+            if numero > MAX_FILAS + 1:
+                raise ValueError('El Excel supera el limite de filas')
+            if fila[-1].value is not None:
+                raise ValueError('El Excel supera el limite de columnas')
+            if any(celda.data_type == 'f' for celda in fila):
+                raise ValueError(f'Fila {numero}: el input contiene formulas; guardar como valores antes de ejecutar')
+            # Mantener solo las columnas con contenido; lectura y memoria acotadas.
+            valores = [celda.value for celda in fila[:-1]]
+            while valores and valores[-1] is None:
+                valores.pop()
+            filas.append(valores)
     finally:
         libro.close()
+        copia_validada.close()
 
     if not filas:
         raise ValueError("El Excel de entrada esta vacio")
@@ -51,7 +71,9 @@ def leer_productos_excel(ruta=None):
         if producto is None or str(producto).strip() == "":
             continue
         supermercado = valor(fila, "supermercado")
-        marca = normalizar_marca(valor(fila, "marca"))
+        producto = texto_entrada(producto, 'producto', numero_fila, 500, obligatorio=True)
+        supermercado = texto_entrada(supermercado, 'supermercado', numero_fila, 100) or None
+        marca = normalizar_marca(texto_entrada(valor(fila, 'marca'), 'marca', numero_fila, 200))
         minimo = leer_precio(valor(fila, "precio_minimo"), "precio_minimo", numero_fila)
         maximo = leer_precio(valor(fila, "precio_maximo"), "precio_maximo", numero_fila)
         if minimo is not None and maximo is not None and minimo > maximo:
@@ -67,6 +89,8 @@ def leer_productos_excel(ruta=None):
             }
         )
 
+    if not tareas:
+        raise ValueError('El Excel no contiene productos para procesar')
     return tareas
 
 

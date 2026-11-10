@@ -1,4 +1,95 @@
+## Arranque completo sin parametros
+
+El contrato configurado ahora es `BACKEND_CONTRATO=cola_actual`, compatible con el
+backend vigente. Completar `BACKEND_MAQUINA_ID` con la VM registrada antes de ejecutar.
+No se inventa ese ID ni se toman trabajos de la cola global cuando falta.
+La [guia del contrato actual](docs/GUIA_BACKEND_ACTUAL.md) explica las funciones
+reutilizables, archivos, configuracion, input opcional, cierre y recuperacion.
+
+Correos con reintentos persistentes, IDs de ejecucion y controles de Excel:
+[guia operativa](docs/CORREOS_TRAZABILIDAD_EXCEL.md).
+
+Con el entorno virtual del proyecto activo, ejecutar desde esta carpeta:
+
+```powershell
+python main.py
+```
+
+Tambien se puede abrir `ejecutar.bat` sin argumentos. Este arranque verifica configuracion,
+Node.js/Chrome y la integridad de SQLite; ejecuta todos los tests del proyecto en un
+proceso aislado e inicializa/verifica la base operativa. Por defecto continua con
+el modo web: se autentica y llama a `/siguiente` con la VM registrada. Un 200 ya toma
+una ejecucion EN_COLA; un 204 termina sin trabajo. Valida el proceso recibido,
+descarga el input si corresponde o utiliza los productos de parametros, realiza
+el scraping y entrega el ZIP. El correo final se prepara despues de la confirmacion web.
+Si una comprobacion falla, sale con codigo 1 y no
+inicia el scraping. `MODULO_SCRAPING=false` mantiene el proceso desactivado.
+
+`python main.py web-procesar` ejecuta directamente el modo web configurado, sin ID manual.
+`python main.py api-verificar` comprueba solo el login. El modo anterior por ID se conserva
+unicamente mediante `BACKEND_CONTRATO=por_id`; no existe fallback automatico por errores HTTP.
+
+Para el modo web sin argumentos, completar el .env privado con
+`ARRANQUE_MODO=web`, `BACKEND_AUTH_MODE=weyland`, `BACKEND_CONTRATO=cola_actual`,
+`BACKEND_MAQUINA_ID` y `BACKEND_PROCESO_CODIGO` con sus registros reales, mas
+la configuracion de conexion. La API key habilita las rutas de bot; login/perfil
+por si solos no prueban permisos de toma o entrega.
+
+Las pruebas usan bases y carpetas temporales, omiten el .env privado y no envian
+correos reales. La revision de la base operativa no borra tareas ni resultados;
+las migraciones existentes conservan sus respaldos. Los logs detallados de los
+tests quedan en `logs/pruebas_DDMMYYYY-HHMMSS_identificador.log`, junto a su JSON resumen.
+
+`PRUEBAS_TIMEOUT_SEGUNDOS` es opcional (600 por defecto, maximo 3600). Si faltan
+tests, dependencias o permisos, o falla algun test, corregir el problema indicado
+en el log antes de volver a iniciar. Si el correo esta habilitado, su configuracion
+debe estar completa; no se prueba el login SMTP enviando mensajes.
+
+Los comandos explicitos `procesar`, `cargar`, `estado`, `reporte`, `api-verificar`
+y `web-procesar` conservan su uso operativo y no vuelven
+a ejecutar la suite completa. Esto evita anidar tests dentro de la ejecucion web.
+Si se desea el arranque local anterior, configurar `ARRANQUE_MODO=local`:
+validara los Excel de input y la cola antes de procesarlos. El modo web utiliza
+solo el input o parametros de su solicitud, sin cargar otros Excel locales.
+
+### Probar el contrato actual sin backend ni correos reales
+
+```powershell
+python -B -m unittest discover -s tests -p test_cola_actual.py -v
+python -B -m unittest discover -s tests -p test_supermercados_cola_actual.py -v
+```
+
+Estas pruebas usan el contrato vigente de cola, input opcional, reporte y recuperacion.
+La segunda prueba usa SQLite y genera el Excel real, con extraccion y SMTP simulados.
+
+### Simulador del contrato anterior por ID
+
+Ejecutar `probar_flujo_web.bat`, o `python probar_flujo_web.py` con el entorno
+virtual activo. Lee obligatoriamente `ID_PRUEBA` y `CODIGO_PRUEBA` del `.env`
+(por ejemplo, 900001 y SUPERMERCADOS_PRUEBA) y usa un servidor HTTP local aislado,
+ejecuta los tests y simula scraping y SMTP. Verifica login, consulta, inicio,
+descarga, reporte, estado COMPLETADA y que el Excel del correo sea identico al
+incluido en el ZIP web. No modifica .env ni usa solicitudes del backend real.
+La evidencia queda en `temporales/prueba_web_<identificador>/resultado_prueba.json`.
+Detalles en [prueba del flujo web](docs/PRUEBA_FLUJO_WEB.md).
+
+Para el backend Django real, consultar primero la [guia de conexion local](docs/conexion_weyland_local.md): modo `weyland`, sesion/CSRF y API key. La documentacion de JWT corresponde al cliente legacy.
+
+## Conexion web comun
+
+Los cuatro bots comparten los modulos base de `integraciones/weyland` v2.0.0.
+Supermercados agrega cuatro modulos portables para el contrato `cola_actual`,
+tambien incluidos en la entrega del SDK y su plantilla. Usar la
+[guia del backend actual](docs/GUIA_BACKEND_ACTUAL.md) para migrar otro bot.
+La [conexion por ID anterior](docs/INTEGRACION_WEYLAND_COMUN.md) se conserva
+como referencia legacy; los otros bots requieren adaptar su arranque y callbacks.
+
+
 # ¿Qué hace este proceso?
+
+El backend actual usa sesion Django/CSRF y API key, documentados en la
+[guia vigente](docs/GUIA_BACKEND_ACTUAL.md). La guia
+[Autenticacion de API](docs/api_autenticacion.md) corresponde al cliente JWT legacy.
 
 **El robot de precios de supermercados** busca productos en Líder, Tottus y
 Unimarc y reúne sus precios en un Excel. Sirve para comparar lo encontrado sin
@@ -377,3 +468,15 @@ ni las notificaciones de TagUI.
 Los selectores web pueden cambiar. En ejecuciones anteriores Tottus y Líder
 mostraron verificaciones de seguridad; el robot las informa cuando las detecta
 y no intenta eludirlas.
+
+
+## Backend Weyland local
+
+Flujo por la solicitud seleccionada por el operador: [solicitudes web](docs/flujo_solicitudes_supermercados.md). Ejecutar `ejecutar.bat web-procesar --id-solicitud 123`, usando el ID real. `solicitud_id` y `ejecucion_id` coinciden; `BACKEND_REUTILIZAR_ULTIMA=false`. Conserva input opcional y resultados asociados al mismo ID.
+
+Login, sesion, ejecuciones web y recuperacion: [guia de conexion](docs/conexion_weyland_local.md). Usar `ejecutar.bat api-verificar` y `ejecutar.bat web-procesar --id-solicitud ID_REAL`.
+
+Resumen completo de módulos, autenticación, endpoints y recuperación: [conexión al backend](docs/RESUMEN_CONEXION_BACKEND.md).
+
+
+Cliente portable para otras maquinas y proyectos: [modulos y ejemplos de reutilizacion](docs/cliente_backend_reutilizable.md). El registro de maquina/proceso se configura posteriormente; no es necesario para construir el cliente ni verificar login.

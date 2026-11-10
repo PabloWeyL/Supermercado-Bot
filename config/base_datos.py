@@ -112,7 +112,6 @@ def _migrar_estructura_anterior(conexion):
 
 
 def _migrar_filtros(conexion):
-    """Reemplaza la unicidad anterior conservando IDs y referencias de resultados."""
     copia = _ruta_db.with_name(_ruta_db.name + '.pre_v3_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '_' + uuid4().hex[:8] + '.bak')
     with closing(sqlite3.connect(copia)) as destino:
         conexion.backup(destino)
@@ -187,7 +186,6 @@ def actualizar_cola(id_tarea, estado, reintentos, fecha_fin=None, error=None):
 
 
 def guardar_resultados(id_tarea, supermercado, producto, resultados, reintentos, fecha):
-    """Guarda el lote y marca su tarea leida en una sola transaccion."""
     if not resultados:
         raise ValueError('No hay resultados para guardar')
     with closing(obtener_db_conexion_sql3()) as conexion, conexion:

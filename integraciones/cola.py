@@ -3,7 +3,7 @@ from contextlib import closing
 
 from config.base_datos import actualizar_archivo, obtener_db_conexion_sql3, registrar_archivo
 from config.configuracion import RUTA_INPUT, ahora, obtener_logger
-from integraciones.productos import leer_productos_excel
+from integraciones.productos import leer_productos_excel, leer_productos_json
 from integraciones.supermercados import cargar_supermercados, seleccionar_supermercados
 
 
@@ -36,13 +36,18 @@ def cargar_excel_a_tabla_cola(ruta=None):
     return resumen
 
 
-def _cargar_archivo_a_cola(ruta):
+def cargar_productos_json_a_tabla_cola(ruta):
+    carga = _cargar_archivo_a_cola(Path(ruta), lector=leer_productos_json)
+    return dict(carga, archivos_leidos=1, archivos_error=0)
+
+
+def _cargar_archivo_a_cola(ruta, lector=None):
     logger = obtener_logger("DETAILS")
     archivo_id = registrar_archivo(ruta, ahora())
     agregadas = 0
     omitidas = 0
     try:
-        tareas = leer_productos_excel(ruta)
+        tareas = (lector or leer_productos_excel)(ruta)
         supermercados = cargar_supermercados()
         tareas_validadas = []
         for tarea in tareas:

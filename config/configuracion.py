@@ -7,6 +7,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from config.base_datos import configurar_base_datos
+from config.credenciales import CAMPOS, leer_credencial
 
 
 RUTA_PROYECTO = Path(__file__).resolve().parent.parent
@@ -36,7 +37,7 @@ RUTA_TEMPORALES = RUTA_BASE / "temporales"
 
 
 def obtener_variable_opcional(nombre, defecto=None):
-    valor = os.getenv(nombre)
+    valor = leer_credencial(nombre) if nombre.upper() in CAMPOS else os.getenv(nombre)
     if valor is None or not str(valor).strip():
         return defecto
     return str(valor).strip()
@@ -77,7 +78,12 @@ def obtener_booleano(nombre, defecto=False):
     valor = obtener_variable_opcional(nombre)
     if valor is None:
         return defecto
-    return valor.strip().upper() in ("TRUE", "SI", "1", "YES", "Y")
+    normalizado = valor.strip().upper()
+    if normalizado in ("TRUE", "SI", "1", "YES", "Y"):
+        return True
+    if normalizado in ("FALSE", "NO", "0", "N"):
+        return False
+    raise RuntimeError(f"Valor booleano invalido para {nombre}")
 
 def ruta_proyecto(valor, defecto):
     ruta = valor or defecto
@@ -114,6 +120,11 @@ RETENCIONES_LOGS_MESES = obtener_entero_positivo("RETENCION_LOGS_MESES", 6)
 
 class FiltroContexto(logging.Filter):
     def filter(self, record):
+        from integraciones.trazabilidad import actual
+        datos = actual()
+        record.solicitud_id = datos['solicitud_id'] or 'SIN_SOLICITUD'
+        record.ejecucion_web_id = datos['ejecucion_id_web'] or 'SIN_SOLICITUD'
+        record.activacion_id = datos['activacion_id'] or 'SIN_ACTIVACION'
         if not hasattr(record, "id_ejecucion"):
             record.id_ejecucion = "SIN_ID"
         if not hasattr(record, "modulo"):
@@ -135,7 +146,9 @@ def configurar_logging():
         handler.close()
 
     formato = logging.Formatter(
-        "%(asctime)s [%(levelname)s] [%(name)s] [ID:%(id_ejecucion)s] [%(modulo)s] %(message)s",
+        "%(asctime)s [%(levelname)s] [%(name)s] [ID_LOCAL:%(id_ejecucion)s] "
+        "[SOLICITUD:%(solicitud_id)s] [EJECUCION_WEB:%(ejecucion_web_id)s] "
+        "[ACTIVACION:%(activacion_id)s] [%(modulo)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 

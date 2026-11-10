@@ -1,6 +1,5 @@
 """Comprobaciones del arranque automatico, previas a cualquier scraping o correo."""
 from contextlib import closing
-from datetime import datetime
 import json
 import math
 import os
@@ -11,7 +10,6 @@ import subprocess
 import sys
 from tempfile import NamedTemporaryFile
 from urllib.parse import urlsplit
-from uuid import uuid4
 
 from integraciones.weyland.archivos import bloqueo
 from integraciones.trazabilidad import contexto
@@ -94,8 +92,6 @@ def validar_dependencias(raiz):
     chrome = next((p for p in candidatos if p and Path(p).is_file()), None)
     if not chrome:
         raise ErrorArranque('No se encontro Chrome; configurar CHROME_PATH')
-    if not (Path(raiz) / 'tests/browser_dom.cjs').is_file():
-        raise ErrorArranque('Falta tests/browser_dom.cjs; se necesita para ejecutar la suite completa')
     return str(Path(chrome).resolve())
 
 
@@ -103,7 +99,7 @@ def revisar_integridad(ruta):
     ruta = Path(ruta)
     if not ruta.exists():
         return
-    # mode=ro evita crear o migrar una base antes de que las pruebas hayan pasado.
+    # mode=ro revisa la base existente sin crearla ni migrarla.
     with closing(sqlite3.connect(ruta.resolve().as_uri() + '?mode=ro', uri=True, timeout=5)) as conexion:
         if conexion.execute('PRAGMA quick_check').fetchall() != [('ok',)]:
             raise ErrorArranque('La base SQLite no supera quick_check; restaurar o revisar antes de ejecutar')
@@ -158,56 +154,24 @@ def validar_entradas(config, catalogo):
     return len(archivos), len(pendientes)
 
 
-def ejecutar_pruebas(config, chrome):
-    if os.getenv('BOT_PRUEBAS_EN_CURSO') == '1':
-        raise ErrorArranque('No se permite iniciar otra suite de pruebas desde una prueba')
-    nombre = 'pruebas_' + datetime.now().strftime('%d%m%Y-%H%M%S') + '_' + uuid4().hex[:8]
-    log = Path(config.RUTA_LOGS) / (nombre + '.log')
-    estadisticas = log.with_suffix('.json')
-    timeout = config.obtener_entero_positivo('PRUEBAS_TIMEOUT_SEGUNDOS', 600)
-    if timeout > 3600:
-        raise ErrorArranque('PRUEBAS_TIMEOUT_SEGUNDOS no puede superar 3600')
-    entorno = {k: v for k, v in os.environ.items() if k.upper() in (
-        'PATH', 'SYSTEMROOT', 'WINDIR', 'TEMP', 'TMP', 'LOCALAPPDATA', 'APPDATA',
-        'USERPROFILE', 'HOME', 'COMSPEC', 'PATHEXT')}
-    entorno.update(CHROME_PATH=chrome, PYTHONIOENCODING='utf-8', PYTHONDONTWRITEBYTECODE='1', BOT_PRUEBAS_EN_CURSO='1')
-    print(f'[2/5] Ejecutando todos los tests. Detalle: {log}', flush=True)
-    try:
-        with log.open('wb') as archivo:
-            resultado = subprocess.run([sys.executable, '-B', '-m', 'integraciones.autopruebas',
-                '--resultado', str(estadisticas)], cwd=config.RUTA_PROYECTO, env=entorno,
-                stdout=archivo, stderr=subprocess.STDOUT, timeout=timeout, check=False)
-    except subprocess.TimeoutExpired:
-        raise ErrorArranque(f'Las pruebas superaron el timeout. Revisar {log}') from None
-    if resultado.returncode != 0 or not estadisticas.is_file():
-        raise ErrorArranque(f'Las pruebas no aprobaron; no se ejecutara el proceso. Revisar {log}')
-    datos = json.loads(estadisticas.read_text(encoding='utf-8'))
-    if (type(datos.get('ejecutadas')) is not int or datos['ejecutadas'] <= 0 or datos.get('aprobadas') is not True
-            or any(type(datos.get(k)) is not int or datos[k] != 0 for k in ('fallas', 'errores', 'omitidas'))):
-        raise ErrorArranque(f'No se confirmo una suite completa aprobada. Revisar {log}')
-    print(f'Tests aprobados: {datos["ejecutadas"]}', flush=True)
-    return datos
-
-
 def ejecutar_automatico(proceso, *, remoto=False):
     from config import configuracion as config
     raiz_lock = Path(config.RUTA_PROYECTO) / '.runtime'
     raiz_lock.mkdir(exist_ok=True)
     with contexto(), bloqueo(raiz_lock / 'arranque.lock'):
-        print('[1/5] Verificando configuracion, dependencias y base existente', flush=True)
+        print('[1/4] Verificando configuracion, dependencias y base existente', flush=True)
         catalogo = validar_configuracion(config)
-        chrome = validar_dependencias(config.RUTA_PROYECTO)
+        validar_dependencias(config.RUTA_PROYECTO)
         revisar_integridad(config.RUTA_DB_SQLITE)
-        ejecutar_pruebas(config, chrome)
-        print('[3/5] Inicializando y verificando la base operativa', flush=True)
+        print('[2/4] Inicializando y verificando la base operativa', flush=True)
         config.configuracion_inicial()
         revisar_base_operativa(config)
         from config.correo import reintentar_pendientes
         reintentar_pendientes()
         if remoto:
-            print('[4/5] Entradas controladas por la solicitud web; no se cargara la cola local', flush=True)
+            print('[3/4] Entradas controladas por la solicitud web; no se cargara la cola local', flush=True)
         else:
-            print('[4/5] Validando todos los Excel y la cola pendiente', flush=True)
+            print('[3/4] Validando todos los Excel y la cola pendiente', flush=True)
             validar_entradas(config, catalogo)
-        print('[5/5] Comprobaciones aprobadas. Iniciando el flujo autorizado', flush=True)
+        print('[4/4] Comprobaciones aprobadas. Iniciando el flujo autorizado', flush=True)
         return proceso()

@@ -95,7 +95,7 @@ def secretos_locales(raiz):
     privado = raiz / '.env'
     if privado.is_file():
         variables.extend(leer_variables(privado.read_text(encoding='utf-8-sig')))
-    return tuple({str(v) for k, v in variables if not k.startswith('SECRET_')
+    return tuple({str(v) for k, v in variables if k not in ('USER', 'USERNAME', 'LOGNAME') and not k.startswith('SECRET_')
         and CLAVE_SENSIBLE.search(k) and len(str(v)) >= 6
         and str(v).casefold() not in ('true', 'false')})
 

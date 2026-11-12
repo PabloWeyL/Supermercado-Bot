@@ -1,162 +1,181 @@
-# Bot de supermercados
+# RPA de supermercados
 
-Consulta productos en los supermercados habilitados y genera un Excel de precios.
-Se conecta a Weyland Automate para recibir una ejecucion y entregar su resultado.
+Consulta productos, genera un reporte Excel y se conecta a Weyland Automate mediante JWT. Se ejecuta con `python main.py` o `ejecutar.bat`.
 
-## Preparacion
+## Arquitectura
 
-Requiere Python 3.11 o posterior, Node.js 22 o posterior y Google Chrome.
-Desde esta carpeta:
+El proyecto tiene 11 archivos Python organizados por responsabilidad:
 
-```powershell
-py -3 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-Copy-Item .env.example .env
+```text
+main.py                       Orquestación, módulos, reintentos y comandos
+config/
+  configuracion.py            .env, settings, flags, logs, ID y validaciones
+  base_datos.py               SQLite, esquema y consultas
+  correo.py                   SMTP y cola persistente de notificaciones
+  formato_excel.py            Estilos del reporte
+  archivos.py                 Constantes, rutas, huellas y persistencia atómica
+  autenticacion.py            JWT BOT, renovación y cierre
+  backend.py                  Endpoints, asignación, input y entrega HTTP
+  ejecuciones.py              Estados, checkpoints y recuperación
+integraciones/
+  supermercados.py           Entradas, catálogo, Chrome y búsqueda de productos
+  reportes.py                 Excel de salida y resumen del proceso
+input/
+procesados/
+reportes/
+temporales/
+logs/
+recursos/                     Puente de Chrome, imágenes y templates
 ```
 
-Completar en `.env` la URL del backend, el ID de VM y el codigo de proceso
-registrados y API key. `MVTESTING` identifica las credenciales
-del ejemplo; no reemplaza el ID numerico de la VM. Para produccion usar HTTPS
-y un `BACKEND_TRABAJOS_DIR` privado fuera del repositorio.
+`config/` no importa módulos de negocio. `main.py` conecta los servicios con la automatización y los reportes. No se incluyen módulos vacíos de Monitor ni Key Vault porque este bot no los utiliza. El catálogo, los selectores, la lectura de entradas, el controlador de Chrome y su puente CDP están integrados en `integraciones/supermercados.py`.
 
-## Ejecucion
+## Instalación
 
-```powershell
-.\.venv\Scripts\python.exe main.py
+Requiere Python 3.11 o posterior, Node.js 22 o posterior y Google Chrome. Desde la raíz:
+
+```bat
+python -m venv .venv
+.venv\Scripts\activate
+python -m pip install -r requirements.txt
+copy .env.example .env
 ```
 
-Con el entorno activo basta `python main.py`. Tambien puede abrirse `ejecutar.bat`.
-El arranque valida configuracion, Chrome/Node.js y SQLite. Luego se autentica con X-Api-Key y
-consulta `/siguiente`. Descarga el Excel asignado o usa los productos recibidos
-en parametros, procesa y envia el ZIP al backend. Un 204 termina sin trabajo,
-con salida 0 (finalizacion normal). No se reutilizan solicitudes antiguas.
+Completar el `.env` privado. Los valores del entorno prevalecen sobre el archivo. Las rutas configurables, los límites y las credenciales mantienen sus nombres existentes.
 
-El input Excel utiliza `producto` y filtros opcionales `supermercado`, `marca`,
-`precio_minimo` y `precio_maximo`. Sin archivo, la web puede enviar
-`{"productos": [{"producto": "leche", "supermercado": "unimarc"}]}`.
+## Flujo y módulos
 
-Otros comandos:
+1. `main.py` inicia el contexto y llama a `configuracion_inicial()`: logging mensual, ID y SQLite. Valida configuración, integridad, Node.js y Chrome antes de procesar.
+2. En modo web, autentica, recupera una ejecución incompleta o toma una solicitud EN_COLA mediante `siguiente`. Verifica máquina y código de proceso y descarga el input si existe.
+3. Módulo 1: correo inicial, si está habilitado. `main.py` aplica `MAX_REINTENTOS_CORREO`; si no se confirma, no inicia el negocio. En modo web se informa ERROR al backend. La cola conserva el aviso para recuperación.
+4. Módulo 2: valida y carga las entradas; ejecuta las consultas. El loop de reintentos está en `main.py` y se aplica por tarea mediante `MAX_REINTENTOS`. No repite consultas ya guardadas correctamente.
+5. Módulo 3: genera el reporte. El orquestador incluye el punto donde agregar otras etapas.
+6. En modo web, entrega el reporte y su estado final juntos. Después notifica resultados o fallas, respetando la bandera web de correo.
+7. Registra FIN. El navegador se cierra en `finally`, incluso si falla su apertura o una búsqueda.
 
-```powershell
+Los POST de toma, estado y entrega no se reintentan con el loop del negocio. Una respuesta incierta se concilia con el backend para evitar duplicados. Si el trabajo ya terminó, un fallo de correo final no vuelve a ejecutar el negocio ni cambia un cierre web confirmado.
+
+## Configuración principal
+
+| Variables | Uso |
+|---|---|
+| `ID_EJECUCION`, `NOMBRE_PROCESO`, `NOMBRE_PROCESO_TEXTO` | Identificación y logs. El ID web siempre lo entrega el backend. |
+| `BACKEND_ACTIVO` | `true`: solicita trabajo al backend con JWT; `false`: procesa solo los Excel locales de `CARPETA_INPUTS`. |
+| `CARPETA_INPUTS` | Carpeta local de entrada; `input` por defecto, admite ruta absoluta o relativa a `RUTA_BASE`. |
+| `MODULO_AUTOMATIZACION_SUPERMERCADOS` | Activa la automatización. Se admite `MODULO_SCRAPING` como alias anterior. |
+| `MODULO_CORREO`, `MODULO_CORREO_INICIAL` | Activan notificaciones. |
+| `MAX_REINTENTOS`, `MAX_REINTENTOS_CORREO` | Intentos máximos por consulta y correo inicial. |
+| `RETENCION_LOGS_MESES` | Retención de los logs mensuales. |
+| `DB_PATH` | Ruta SQLite; el modo web utiliza una base aislada por ejecución. |
+| `MAX_ARCHIVO`, `MAX_EXPANDIDO`, `MAX_FILAS`, `MAX_COLUMNAS` | Límites de seguridad de la entrada. |
+| `MAX_ADJUNTOS_BYTES` | Límite de adjuntos de correo. |
+
+## Conexión al backend
+
+```dotenv
+BACKEND_AUTH_MODE=weyland
+BACKEND_BOT_AUTH_MODE=jwt
+BACKEND_CONTRATO=cola_actual
+BACKEND_API_URL=https://automate.example.com/api
+BACKEND_BOT_LOGIN_RUTA=/bot/sesion
+BACKEND_BOT_REFRESH_RUTA=/bot/sesion/renovar
+BACKEND_BOT_CERRAR_RUTA=/bot/sesion/cerrar
+BACKEND_MAQUINA_ID=1
+BACKEND_PROCESO_CODIGO=SUPERMERCADOS
+BACKEND_TRABAJOS_DIR=temporales/weyland
+BACKEND_REUTILIZAR_ULTIMA=false
+BACKEND_REFRESH_ACTIVO=true
+BACKEND_REFRESH_MARGEN_SEGUNDOS=60
+```
+
+El ID y código del ejemplo deben corresponder a registros reales. Para producción, usar HTTPS, `ENTORNO=PRODUCCION` y un directorio operativo fuera del repositorio. HTTP se admite solo en loopback con `BACKEND_PERMITIR_HTTP_LOCAL=true`.
+
+Las credenciales estandarizadas son `WEYLAND_AUTOMATE_MVTESTING_USER` y `WEYLAND_AUTOMATE_MVTESTING_PWD`; empresa y VM se resuelven mediante `CREDENCIALES_EMPRESA` y `CREDENCIALES_VM`. No se utiliza API key en el arranque actual.
+
+El bot inicia sesión directamente con `POST /api/bot/sesion`, enviando correo, contraseña y el ID de máquina configurado. Conserva `access_token`, `refresh_token` y su vencimiento únicamente en memoria; envía `Authorization: Bearer <access_token>` a `/api/bot/*`. No llama a `/api/auth/csrf`, `/api/auth/login`, `/api/auth/perfil` ni `/api/auth/sesion` en este modo. El refresh rota ambos tokens; si su respuesta se pierde, no se reutiliza el anterior. Al cerrar el cliente se intenta cerrar la sesión BOT y siempre se limpian sus tokens.
+
+El contrato actual toma una solicitud por invocación. Un HTTP 204 termina sin trabajo. No se reutiliza la última solicitud ni se inventan IDs. Se admiten `input: null` y productos JSON en parámetros cuando corresponda.
+
+## Entradas y reportes
+
+El modo local lee todos los `.xlsx` y `.xlsm` de `input/`, sin exigir un nombre. Columna obligatoria: `producto`. Opcionales: `supermercado`, `marca`, `precio_minimo`, `precio_maximo`.
+
+Se validan los bytes OOXML, expansión, filas, columnas y textos; no se admiten fórmulas ni contenido activo. En modo web se procesan únicamente los datos de la solicitud asignada.
+
+El Excel incluye productos encontrados y consultas sin resultado, con una columna `error`. Los resultados correctos la dejan vacía. La entrega web es `resultado_DDMMYYYY-HHMMSS.zip` y contiene solo `datos/reportes/resultados.xlsx`; no incluye el JSON de ejecución, inputs, logs ni bases de datos.
+
+Los estados son PENDIENTE, EN_EJECUCION, EN_REPROCESO y los cierres FINALIZADO, FINALIZADO_CON_OBSERVACIONES, CANCELADO, INTERRUMPIDO o ERROR. Se envía el código del estado. El reporte y el cierre exitoso se entregan juntos.
+
+## Comandos
+
+```bat
+python main.py
 python main.py api-verificar
 python main.py web-procesar
 python main.py procesar
+python main.py procesar --productos-json ruta/productos.json
+python main.py cargar
 python main.py estado
-```
-
-`api-verificar` comprueba la API key sin tomar una ejecucion. `web-procesar` entra directamente al flujo
-web. `procesar` ejecuta el modo local con los Excel de `input/`.
-
-## Resultados y correo
-
-Los archivos web se conservan bajo `BACKEND_TRABAJOS_DIR`, separados por ID.
-Los reportes locales quedan en `reportes/`. Logs y SQLite permiten revisar fallos.
-No borrar checkpoints de entregas inciertas para forzar otro inicio.
-
-Para habilitar SMTP, completar las credenciales y listas antes de activar
-`MODULO_CORREO=true`. Inicio y resultados llegan a ambas listas; fallas solo a
-`LISTA_DISTRIBUCION_ERROR`. El resultado se avisa despues de la confirmacion web
-y adjunta el mismo archivo enviado al backend.
-
-### Diagnostico y codigos de salida
-
-`python main.py` y `ejecutar.bat` devuelven el mismo codigo:
-
-| Codigo | Significado |
-| --- | --- |
-| 0 | Ejecucion completada, sin solicitudes o comando de consulta correcto. |
-| 1 | Fallo del procesamiento u otro fallo operativo. |
-| 2 | Configuracion, dependencias o argumentos invalidos. |
-| 3 | Autenticacion o permisos rechazados (HTTP 401/403). |
-| 4 | Backend no disponible, peticion rechazada o asignacion sin confirmar. |
-| 5 | Proceso, contrato o checkpoint incompatible. |
-| 6 | Input invalido o descarga fallida. |
-| 7 | Export pendiente o entrega del resultado/fallo sin confirmar. |
-| 8 | Procesamiento interrumpido; requiere revision antes de repetirlo. |
-| 9 | Gestion de correo fallida o destinatarios pendientes de entrega/revision. |
-
-Los mensajes publicos no muestran credenciales ni cuerpos HTTP. Una entrega
-sin confirmacion conserva el checkpoint y no se reenvia automaticamente.
-Un resultado confirmado por la web mantiene salida 0 aunque SMTP tenga pendientes;
-la recuperacion de correo se gestiona por separado y no repite el negocio.
-
-### Recuperar correos sin repetir el proceso
-
-La cola conserva el mensaje MIME y los adjuntos en SQLite. Aunque se retire el
-export original, el correo encolado conserva su copia. Los destinatarios ya
-aceptados por SMTP no vuelven a recibir el mensaje durante los reintentos.
-
-```powershell
+python main.py reporte
 python main.py correos-estado
-python main.py correos-reintentar --id-correo ID_DEL_CORREO
+python main.py correos-reintentar --id-correo ID
 ```
 
-El segundo comando reintenta exclusivamente el correo indicado, respeta la espera
-de reintento y devuelve 9 si ese mensaje sigue pendiente. Sin `--id-correo`, revisa
-la cola general. `AGOTADO` requiere reactivacion explicita mediante el comando
-con ID. `INCIERTO` nunca se reenvia automaticamente: primero se comprueba con el
-proveedor SMTP si fue aceptado y se registra la resolucion:
+`api-verificar` inicia la sesión JWT BOT y comprueba el acceso sin tomar solicitudes: un GET autenticado a `siguiente` debe responder 405, porque la toma admite únicamente POST. `procesar` explícito utiliza el flujo local; sin comando se respeta `BACKEND_ACTIVO`. `ejecutar.bat` admite los mismos argumentos y conserva el código de salida.
 
-```powershell
-python main.py correos-resolver --id-correo ID_DEL_CORREO --destinatario persona@ejemplo.test --entregado
-python main.py correos-resolver --id-correo ID_DEL_CORREO --destinatario persona@ejemplo.test --no-entregado
+## Correo y recuperación
+
+SMTP se configura con `SMTP_SERVER`, `SMTP_PORT`, las credenciales estandarizadas `WEYLAND_SMTP_MVTESTING_USER` / `WEYLAND_SMTP_MVTESTING_PWD` y las listas de distribución. Inicio y resultados van a ambas listas; fallas a `LISTA_DISTRIBUCION_ERROR`. Se eliminan destinatarios repetidos.
+
+La web puede deshabilitar avisos mediante `configuracion.notificar_correo=false`. La entrega web es independiente del correo. Los envíos se conservan por destinatario y no se reenvían si ya están aceptados por SMTP. Una entrega incierta requiere revisión con el proveedor:
+
+```bat
+python main.py correos-resolver --id-correo ID --entregado
+python main.py correos-resolver --id-correo ID --no-entregado
 ```
 
-Son alternativas: `--entregado` cierra la entrega confirmada; `--no-entregado`
-habilita su posterior reintento. Estos comandos no consultan solicitudes,
-no procesan productos y no vuelven a subir archivos al backend. En modo web,
-la politica de notificacion se aplica al encolar el aviso; no se drena la cola
-global automaticamente. La recuperacion manual debe respetar las decisiones
-del operador sobre los mensajes ya encolados.
+Conservar checkpoints y evidencia de `BACKEND_TRABAJOS_DIR`: una toma o entrega sin confirmación requiere conciliación manual desde la web en modo JWT BOT; un callback interrumpido no se repite automáticamente. El backend local no permite usar el JWT BOT en `/api/ejecuciones`, sus detalles, archivos ni catálogo: son endpoints del frontend. El bot bloquea esas consultas sin intentar un login web alternativo y no reenvía automáticamente operaciones inciertas. Los checkpoints existentes conservan el mismo formato y las mismas rutas. Un rechazo 401/403 en la toma se registra como TOMA_RECHAZADA; un timeout permanece TOMA_INCIERTA.
 
-## Publicacion
+Para agregar un módulo: declarar su flag y settings en `config/configuracion.py` y `.env`, agregar sus consultas a `base_datos.py`, implementar el negocio en `integraciones/` y llamarlo desde `main.py` con `ejecutar_modulo()`. No colocar lógica de negocio en los servicios HTTP.
 
-`.env`, inputs, media, bases, logs, temporales y exportaciones quedan excluidos.
-Las plantillas de credenciales se comparten vacias. Activar los controles locales:
+## Dirección del navegador
 
-```powershell
-git config core.hooksPath .githooks
-python tools/verificar_publicacion.py
+Configurar `RPA_CHROME_URL=http://127.0.0.1:9222` en `.env`. Esta dirección corresponde al servicio local de Chrome, no al backend. Se utiliza tanto para consultar Chrome como para iniciar su puerto de automatización. Solo admite HTTP en loopback, con puerto y sin credenciales, rutas ni parámetros. Si no se define, se conserva el puerto de `RPA_CHROME_PUERTO` (9222 por defecto); cuando se define, prevalece el puerto de la URL.
+
+## Configuración operativa en .env
+
+Las credenciales de Automate y SMTP continúan en las variables privadas estandarizadas. No se incorporan contraseñas ni tokens al código, al catálogo ni a la plantilla. Los tokens JWT siguen siendo temporales y permanecen en memoria.
+
+Las URLs de tiendas se configuran mediante `SUPERMERCADO_LIDER_URL`, `SUPERMERCADO_TOTTUS_URL` y `SUPERMERCADO_UNIMARC_URL`. Lider conserva el marcador literal `{termino}` para construir cada búsqueda. Las esperas de cada tienda usan `SUPERMERCADO_<TIENDA>_ESPERA` y, cuando corresponde, `SUPERMERCADO_<TIENDA>_ESPERA_RESULTADOS`. El catálogo JSON contiene sus nombres de variable y los selectores DOM.
+
+| Grupo | Variables |
+|---|---|
+| Consultas | `MAX_PRODUCTOS_POR_BUSQUEDA`, `RPA_TIMEOUT`, `RPA_ESPERA_MAX`, `RPA_DOM_REINTENTOS`, `RPA_RESULTADOS_INTERVALO`, `RPA_ESCRITURA_PAUSA` |
+| Navegador | `RPA_CHROME_URL`, `RPA_HTTP_TIMEOUT`, `RPA_CIERRE_TIMEOUT`, `RPA_SONDEO_INTERVALO`, `RPA_JS_REINTENTOS`, `RPA_JS_PAUSA`, `RPA_CAPTURA_PAUSA` |
+| Archivos y reintentos | `ARCHIVO_REINTENTOS`, `ARCHIVO_REINTENTO_PAUSA`, `REINTENTOS_PAUSA`, `REINTENTOS_PAUSA_MAX` |
+| Correo y BD | `SMTP_TIMEOUT`, `DB_TIMEOUT`, `CORREO_DB_TIMEOUT` |
+| Límites | `BACKEND_MAX_BYTES`, `BACKEND_MAX_PAGINAS`, `MAX_EXCEL_ENTRADAS_ZIP` y los límites Excel existentes |
+| Dependencias | `DEPENDENCIAS_TIMEOUT`; `CHROME_PATH` opcional para reemplazar la detección automática |
+
+Los tiempos se expresan en segundos; los tamaños, en bytes. Se rechazan números negativos, cero, NaN e infinito en los ajustes que requieren valores positivos. Las URLs de supermercados requieren HTTPS sin credenciales. El entorno del sistema prevalece sobre `.env`; reiniciar el bot después de cambiar valores.
+
+El puente CDP es una constante dentro de `integraciones/supermercados.py` y Node.js lo ejecuta en memoria con `-e`; no necesita un archivo `.cjs` externo ni una ruta en `.env`. `config/configuracion.py` centraliza los valores y conserva valores predeterminados compatibles para los ajustes opcionales. Los códigos HTTP, nombres de endpoints y espacios de nombres XML son detalles del contrato y permanecen en el código.
+
+## Activar o desactivar la conexión al backend
+
+```dotenv
+BACKEND_ACTIVO=true
+CARPETA_INPUTS=input
 ```
 
-El verificador inspecciona los archivos preparados para commit; los hooks y el
-workflow de GitHub complementan la revision humana. Esta entrega operativa no
-incluye tests, simuladores ni documentacion adicional.
+Con `true`, `python main.py` autentica por JWT y toma una solicitud del backend: descarga su input si existe o utiliza sus parámetros JSON. Después publica los estados y entrega el reporte. Si la web no responde o no hay solicitudes, no utiliza automáticamente archivos locales.
 
+Con `false`, el mismo comando lee todos los Excel compatibles de `CARPETA_INPUTS`, sin exigir un nombre. No inicia sesión, consulta, descarga ni sube resultados al backend. Limita las tareas y el reporte a esos archivos; conserva el historial en SQLite sin incorporar trabajo de archivos que ya no están en la carpeta. Si no hay Excel, falla la validación de entrada. Las validaciones y el correo siguen respetando su configuración independiente.
 
-## Correo controlado desde Weyland
+`ARRANQUE_MODO` fue sustituido por `BACKEND_ACTIVO`. Con el backend desactivado, `api-verificar` informa que no realizará peticiones y `web-procesar` se rechaza. El argumento `--productos-json` requiere tener el backend habilitado; el subproceso de una solicitud web lo utiliza cuando corresponde. `procesar` sigue siendo el comando local explícito utilizado también por el coordinador.
 
-La configuracion de habilitacion de empresa/proceso puede incluir
-`{"notificar_correo": false}` para suprimir inicio, resultados y fallas por SMTP.
-`true` permite esos avisos si el correo local esta habilitado y configurado.
-Si falta el campo, se conserva la configuracion local. Debe ser booleano JSON,
-no el texto "false". El envio del resultado/error al backend sigue siendo obligatorio.
+## Automatización unificada
 
-El backend actual ya permite guardar ese objeto mediante
-`PUT /api/procesos/{proceso_id}/empresas/{empresa_id}` con
-`{"activo": true, "configuracion": {"notificar_correo": false}}`, usando permisos
-de gestion de procesos. Conservar las otras claves de configuracion al actualizarlo.
-No se agrego un endpoint ni un control visual nuevo al backend.
+`integraciones/supermercados.py` reúne el catálogo `CATALOGO_SUPERMERCADOS`, el puente `PUENTE_CHROME_JS`, la clase `ChromeRobot`, la lectura segura de Excel/JSON y las búsquedas. Cada función y método incluye su descripción mediante una docstring `"""..."""` como primera instrucción. Las URLs, esperas y límites se siguen leyendo de `.env`.
 
-El bot lee la bandera en la respuesta de `/siguiente` y la conserva para esa
-ejecucion y sus recuperaciones. Los cambios web se aplican a las siguientes
-asignaciones. Los journals antiguos o una toma recuperada sin su configuracion
-no autorizan correos automaticos; el negocio y la entrega web pueden continuar.
-En modo web no se drena una cola global de correos antes de tomar el trabajo.
-Los comandos manuales de correo, donde existan, siguen siendo acciones del operador.
-
-## Autenticacion de este despliegue
-
-Supermercados usa `BACKEND_AUTH_MODE=api_key` y `BACKEND_CONTRATO=cola_actual`.
-Solo necesita la API key del bot para los requests `/api/bot/*`; no llama a login,
-perfil ni CSRF, y no envia correo/password de acceso al backend. Los otros bots
-conservan su modo de autenticacion configurado.
-
-La verificacion usa GET `/api/bot/ejecuciones/siguiente` con la clave y exige
-HTTP 405 con codigo `METODO_NO_PERMITIDO`. La API valida la clave antes de rechazar
-el metodo: esta peticion no toma trabajo. Los POST de negocio no se repiten
-automaticamente ante errores o cortes.
-
-La conciliacion automatica por `/api/ejecuciones/*` requiere sesion de usuario.
-En modo solo API key, una toma o entrega incierta conserva su checkpoint y exige
-revision; no se intenta un login ni se reenvia el resultado a ciegas.
+`main.py` llama a `supermercados.validar_catalogo()`, las funciones de carga y `procesar_cola_a_resultados()`. `integraciones/reportes.py` reutiliza las funciones de formato literal y clasificación de incidencias del mismo módulo. El módulo de configuración valida los servicios técnicos y no importa la automatización.

@@ -24,7 +24,6 @@ from uuid import uuid4
 CAMPOS = {
     'BACKEND_EMAIL': ('AUTOMATE', 'USER'),
     'BACKEND_PASSWORD': ('AUTOMATE', 'PWD'),
-    'BACKEND_BOT_API_KEY': ('AUTOMATE', 'API_KEY'),
     'EMAIL_REMITENTE': ('SMTP', 'USER'),
     'EMAIL_PASSWORD': ('SMTP', 'PWD'),
     'MONITOR_USER': ('MONITOR', 'USER'),
@@ -37,6 +36,9 @@ CAMPOS = {
 IDENTIDAD = ('CREDENCIALES_EMPRESA', 'CREDENCIALES_VM')
 
 
+#----------------------------------------------
+# FUNCIONES DE CREDENCIALES Y CONFIGURACIÓN
+#----------------------------------------------
 def nombres_estandar(valores):
     """Calcula los nombres de credenciales según la empresa y la máquina configuradas."""
     empresa = str(valores.get('CREDENCIALES_EMPRESA') or '').strip().upper()
@@ -82,12 +84,16 @@ def leer_credencial(nombre):
     return normalizar_credenciales(os.environ).get(nombre.upper())
 
 
-_contexto = ContextVar('contexto_bot', default=None)
+CONTEXTO_EJECUCION = ContextVar('contexto_bot', default=None)
+IDENTIFICADOR_LOCAL = ContextVar('identificador_local', default=None)
 
 
+#----------------------------------------------
+# FUNCIONES DE CONTEXTO Y TRAZABILIDAD
+#----------------------------------------------
 def actual():
     """Recupera el contexto vigente o construye sus identificadores desde el entorno."""
-    guardado = _contexto.get()
+    guardado = CONTEXTO_EJECUCION.get()
     if guardado is not None:
         return dict(guardado)
     valor = os.getenv('WEYLAND_SOLICITUD_ID', '').strip()
@@ -108,7 +114,7 @@ def contexto(datos=None, solicitud_id=None):
             or any(datos.get(k) is not None and (type(datos[k]) is not int or datos[k] < 1)
                    for k in ('solicitud_id', 'ejecucion_id_web'))):
         raise ValueError('Contexto de trazabilidad invalido')
-    token = _contexto.set(datos)
+    token = CONTEXTO_EJECUCION.set(datos)
     try:
         yield datos
     except Exception as error:
@@ -116,7 +122,7 @@ def contexto(datos=None, solicitud_id=None):
             error.contexto_trazabilidad = dict(datos)
         raise
     finally:
-        _contexto.reset(token)
+        CONTEXTO_EJECUCION.reset(token)
 
 
 def metadatos():
@@ -127,7 +133,10 @@ def metadatos():
 load_dotenv(ARCHIVO_ENV)
 
 
-def _resolver_ruta_base(valor):
+#----------------------------------------------
+# FUNCIONES DE RESOLUCIÓN DE LA RUTA BASE
+#----------------------------------------------
+def resolver_ruta_base(valor):
     """Resuelve la raíz operativa absoluta usando la carpeta del proyecto cuando corresponde."""
     valor =(valor or "").strip()
     if not valor:
@@ -138,7 +147,7 @@ def _resolver_ruta_base(valor):
     return ruta.resolve()
 
 
-RUTA_BASE = _resolver_ruta_base(os.getenv("RUTA_BASE"))
+RUTA_BASE = resolver_ruta_base(os.getenv("RUTA_BASE"))
 RUTA_CONFIG = RUTA_PROYECTO / "config"
 RUTA_LOGS = RUTA_BASE / "logs"
 RUTA_RECURSOS = RUTA_BASE / "recursos"
@@ -149,6 +158,9 @@ RUTA_REPORTES = RUTA_BASE / "reportes"
 RUTA_TEMPORALES = RUTA_BASE / "temporales"
 
 
+#----------------------------------------------
+# FUNCIONES DE LECTURA Y VALIDACIÓN DE VARIABLES
+#----------------------------------------------
 def obtener_variable_opcional(nombre, defecto=None):
     """Lee una variable o credencial normalizada y utiliza el valor predeterminado si está vacía."""
     valor = (leer_credencial(nombre) if nombre.upper() in CAMPOS
@@ -235,6 +247,8 @@ def obtener_decimal_positivo(nombre, defecto):
 # Ajustes operativos: los valores efectivos proceden de .env o del entorno.
 BACKEND_MAX_BYTES = obtener_entero_positivo('BACKEND_MAX_BYTES', 20971520)
 BACKEND_MAX_PAGINAS = obtener_entero_positivo('BACKEND_MAX_PAGINAS', 100)
+BACKEND_MAX_INPUTS = obtener_entero_positivo('BACKEND_MAX_INPUTS', 100)
+BACKEND_MAX_INPUTS_BYTES = obtener_entero_positivo('BACKEND_MAX_INPUTS_BYTES', 104857600)
 ARCHIVO_REINTENTOS = obtener_entero_positivo('ARCHIVO_REINTENTOS', 5)
 MAX_PRODUCTOS_POR_BUSQUEDA = obtener_entero_positivo('MAX_PRODUCTOS_POR_BUSQUEDA', 5)
 RPA_JS_REINTENTOS = obtener_entero_positivo('RPA_JS_REINTENTOS', 3)
@@ -271,6 +285,9 @@ if not 1 <= RPA_CHROME_PUERTO <= 65535:
     raise RuntimeError("RPA_CHROME_PUERTO debe estar entre 1 y 65535")
 
 
+#----------------------------------------------
+# FUNCIONES DE VALIDACIÓN DE CHROME
+#----------------------------------------------
 def validar_url_chrome(valor):
     """Acepta una dirección HTTP local sin credenciales, rutas ni parámetros."""
     try:
@@ -300,6 +317,9 @@ CARPETA_CAPTURAS = ruta_proyecto(obtener_variable_opcional("CARPETA_CAPTURAS"), 
 RETENCIONES_LOGS_MESES = obtener_entero_positivo("RETENCION_LOGS_MESES", 6)
 
 
+#----------------------------------------------
+# FUNCIONES DE LOGGING Y RETENCIÓN
+#----------------------------------------------
 class FiltroContexto(logging.Filter):
     def filter(self, record):
         """Añade al registro de log los identificadores y el módulo de la ejecución actual."""
@@ -385,7 +405,9 @@ def limpiar_logs_antiguos(logger, ruta_log_actual):
 def obtener_logger(modulo, id_ejecucion_logger=None):
     """Obtiene el logger del módulo incorporando la identificación local y el contexto."""
     if id_ejecucion_logger is None:
-        id_ejecucion_logger = id_ejecucion if id_ejecucion is not None else "SIN_ID"
+        id_ejecucion_logger = IDENTIFICADOR_LOCAL.get()
+        if id_ejecucion_logger is None:
+            id_ejecucion_logger = "SIN_ID"
 
     logger = logging.getLogger(NOMBRE_PROCESO)
     return logging.LoggerAdapter(
@@ -397,6 +419,9 @@ def obtener_logger(modulo, id_ejecucion_logger=None):
     )
 
 
+#----------------------------------------------
+# FUNCIONES DE FECHA Y REGISTRO
+#----------------------------------------------
 def ahora():
     """Devuelve la fecha y hora local en el formato utilizado por la base de datos."""
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -412,12 +437,26 @@ def registrar(mensaje, modulo="GENERAL"):
     obtener_logger(modulo).info(mensaje)
 
 
-id_ejecucion = None
+@contextmanager
+def ambito_identificacion():
+    """Aísla el ID local de una invocación y restaura el contexto al terminar."""
+    token = IDENTIFICADOR_LOCAL.set(None)
+    try:
+        yield
+    except Exception as error:
+        if not hasattr(error, 'id_ejecucion_local'):
+            error.id_ejecucion_local = IDENTIFICADOR_LOCAL.get()
+        raise
+    finally:
+        IDENTIFICADOR_LOCAL.reset(token)
 
 
+#----------------------------------------------
+# FUNCIONES DE CONFIGURACIÓN INICIAL
+#----------------------------------------------
 def configuracion_inicial():
     """Inicia logging, verifica SQLite e inicializa la base y la identificación del proceso."""
-    global id_ejecucion
+    id_ejecucion = None
     configurar_logging()
     revisar_integridad(RUTA_DB_SQLITE)
     configurar_base_datos(RUTA_DB_SQLITE)
@@ -432,6 +471,7 @@ def configuracion_inicial():
         logger.info(f"CONFIGURAR INICIO CON ID_EJECUCION: {id_ejecucion}")
     else:
         logger.info("CONFIGURAR INICIO SIN ID_EJECUCION")
+    IDENTIFICADOR_LOCAL.set(id_ejecucion)
     logger = obtener_logger("CONFIGURACIÓN", id_ejecucion)
     logger.info("CONFIGURACIÓN INICIAL FINALIZADA CORRECTAMENTE")
     return id_ejecucion
@@ -443,11 +483,14 @@ MODULO_AUTOMATIZACION_SUPERMERCADOS = obtener_booleano(
     "MODULO_AUTOMATIZACION_SUPERMERCADOS", obtener_booleano("MODULO_SCRAPING", True))
 MODULO_SCRAPING = MODULO_AUTOMATIZACION_SUPERMERCADOS
 
+#----------------------------------------------
+# ERRORES Y VALIDACIONES DE ARRANQUE
+#----------------------------------------------
 class ErrorArranque(RuntimeError):
     pass
 
 
-def _probar_directorio(ruta):
+def probar_directorio(ruta):
     """Comprueba que un directorio operativo pueda crearse y recibir archivos temporales."""
     ruta = Path(ruta)
     ruta.mkdir(parents=True, exist_ok=True)
@@ -473,7 +516,7 @@ def validar_configuracion(config):
     for ruta in (config.RUTA_LOGS, config.RUTA_REPORTES, config.RUTA_TEMPORALES,
                  Path(config.RUTA_DB_SQLITE).parent, Path(config.EXCEL_SALIDA).parent,
                  Path(config.CARPETA_CAPTURAS)):
-        _probar_directorio(ruta)
+        probar_directorio(ruta)
     if config.MODULO_CORREO:
         for nombre in ('smtp_server', 'email_remitente', 'email_password'):
             if not config.obtener_variable_opcional(nombre):

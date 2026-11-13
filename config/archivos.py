@@ -10,33 +10,37 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 
+#----------------------------------------------
+# ERRORES DE INTEGRACIÓN
+#----------------------------------------------
 class ErrorWeyland(RuntimeError):
-    pass
+    """Error único del backend; conserva su categoría sin incluir credenciales."""
 
+    TIPOS = frozenset(('CONTRATO', 'HTTP', 'RED', 'SIN_PENDIENTES', 'ASIGNACION_INCOMPATIBLE'))
 
-class ErrorHTTPWeyland(ErrorWeyland):
-    def __init__(self, status_code):
-        """Conserva el código HTTP rechazado sin incluir datos privados de la petición."""
+    def __init__(self, mensaje=None, *, tipo='CONTRATO', status_code=None, ejecucion_id=None):
+        """Conserva categoría, rechazo HTTP e ID cuando existen para decidir la recuperación."""
+        if status_code is not None:
+            if tipo not in ('CONTRATO', 'HTTP'):
+                raise ValueError('Un rechazo HTTP no puede tener otra categoria')
+            if type(status_code) is not int or not 100 <= status_code <= 599:
+                raise ValueError('Codigo HTTP invalido')
+            tipo = 'HTTP'
+        if tipo not in self.TIPOS or tipo == 'HTTP' and status_code is None:
+            raise ValueError('Tipo de error Weyland incompatible')
+        if ejecucion_id is not None and (type(ejecucion_id) is not int or ejecucion_id < 1):
+            raise ValueError('ID de ejecucion invalido')
+        self.tipo = tipo
         self.status_code = status_code
-        super().__init__(f'Weyland rechazo la operacion (HTTP {status_code})')
-
-
-class ErrorRedWeyland(ErrorWeyland):
-    """Operacion incierta: no repetir automaticamente peticiones con efectos."""
-
-
-class SinPendientes(ErrorWeyland):
-    pass
-
-
-class AsignacionIncompatible(ErrorWeyland):
-    """La reserva ya ocurrio en la web, pero este bot no debe ejecutarla."""
-
-    def __init__(self, ejecucion_id):
-        """Identifica la ejecución reservada que requiere revisión por una asignación incompatible."""
         self.ejecucion_id = ejecucion_id
-        super().__init__(f'La asignacion de la ejecucion #{ejecucion_id} no coincide con '
-                         'VM/proceso. Ya fue reservada; requiere revision del operador.')
+        mensajes = {
+            'CONTRATO': 'La operacion no cumple el contrato Weyland.',
+            'HTTP': f'Weyland rechazo la operacion (HTTP {status_code})',
+            'RED': 'Operacion sin confirmacion por un fallo de transporte; conservar evidencia.',
+            'SIN_PENDIENTES': 'No hay solicitudes pendientes.',
+            'ASIGNACION_INCOMPATIBLE': 'La asignacion no coincide con el bot; revisar antes de otra toma.',
+        }
+        super().__init__(mensaje if mensaje is not None else mensajes[tipo])
 
 
 CARPETA_DATOS = 'datos'
@@ -66,10 +70,6 @@ EXTENSIONES_INPUT_POR_DEFECTO = ('.xlsx',)
 EXTENSIONES_EXCEL = (*EXTENSIONES_INPUT_POR_DEFECTO, '.xlsm')
 EXTENSIONES_TABULARES = (*EXTENSIONES_EXCEL, '.csv')
 EXTENSIONES_EXPORTABLES = (*EXTENSIONES_TABULARES, '.json', '.txt')
-RUTA_AUTH_CSRF = '/auth/csrf'
-RUTA_AUTH_LOGIN = '/auth/login'
-RUTA_AUTH_PERFIL = '/auth/perfil'
-RUTA_AUTH_SESION = '/auth/sesion'
 RUTA_BOT_SESION = '/bot/sesion'
 RUTA_BOT_RENOVAR = '/bot/sesion/renovar'
 RUTA_BOT_CERRAR = '/bot/sesion/cerrar'
@@ -88,6 +88,9 @@ RUTA_ARCHIVO_EJECUCION = RUTA_DETALLE_EJECUCION + '/archivos/{archivo_id}'
 RUTA_PROYECTO = Path(__file__).resolve().parents[1]
 ARCHIVO_ENV = RUTA_PROYECTO / '.env'
 
+#----------------------------------------------
+# RUTAS DE CADA EJECUCIÓN
+#----------------------------------------------
 @dataclass(frozen=True)
 class RutasEjecucion:
     raiz: Path
@@ -162,6 +165,9 @@ class RutasEjecucion:
         return self.raiz / ARCHIVO_CONTEXTO
 
 
+#----------------------------------------------
+# FUNCIONES DE ESCRITURA ATÓMICA
+#----------------------------------------------
 def reemplazar_atomico(parcial, destino):
     """Tolera bloqueos transitorios de Windows sin repetir HTTP ni el negocio."""
     from config.configuracion import ARCHIVO_REINTENTOS, ARCHIVO_REINTENTO_PAUSA
@@ -191,6 +197,9 @@ def guardar_json(ruta, datos):
             parcial.unlink(missing_ok=True)
 
 
+#----------------------------------------------
+# FUNCIONES DE INTEGRIDAD Y RUTAS SEGURAS
+#----------------------------------------------
 def sha256(ruta):
     """Calcula la huella SHA-256 de un archivo para comprobar su integridad."""
     with Path(ruta).open('rb') as archivo:
@@ -209,6 +218,9 @@ def confinar(raiz, ruta):
     return destino
 
 
+#----------------------------------------------
+# FUNCIONES DE BLOQUEO DE EJECUCIÓN
+#----------------------------------------------
 @contextmanager
 def bloqueo(ruta):
     """Mantiene un bloqueo exclusivo de archivo y lo libera incluso si ocurre un error."""

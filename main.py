@@ -6,28 +6,36 @@ import os
 import subprocess
 import sys
 import time
-from config.archivos import ErrorHTTPWeyland, ErrorRedWeyland, ErrorWeyland, SinPendientes
+from config.archivos import (
+    ErrorWeyland,
+)
 from dataclasses import dataclass
 from contextlib import nullcontext
 from pathlib import Path
 
-_ERROR_CARGA = None
+CARGA_INVALIDA = False
 try:
     from config import configuracion, correo, base_datos
     from config.archivos import RutasEjecucion, bloqueo, confinar, guardar_json, EXTENSIONES_EXCEL
     from config.backend import crear_cliente_api, leer_valores
     from config.ejecuciones import ProcesoBot, ResultadoBot, ejecutar_cola_configurada
     from integraciones import supermercados, reportes
-except (ImportError, RuntimeError, ValueError, OSError) as error:
-    _ERROR_CARGA = error
+except (ImportError, RuntimeError, ValueError, OSError):
+    CARGA_INVALIDA = True
 
 CODIGOS_INTERRUMPIDOS = frozenset((-2, -9, -15, -1073741510, 3221225786))
 
 
+#----------------------------------------------
+# ERRORES DE INICIO
+#----------------------------------------------
 class ErrorCorreoInicial(RuntimeError):
     """No se inicia el negocio si el correo inicial obligatorio no se confirma."""
 
 
+#----------------------------------------------
+# FUNCIONES DE REINTENTOS Y PREPARACIÓN
+#----------------------------------------------
 def ejecutar_modulo(nombre, accion, intentos, *, al_fallar=None):
     """Reintentos de una etapa concreta; nunca envuelve la toma o entrega web."""
     logger = configuracion.obtener_logger('ORQUESTADOR')
@@ -57,6 +65,9 @@ def preparar_proceso(*, remoto=False):
         supermercados.validar_entradas(configuracion, catalogo)
 
 
+#----------------------------------------------
+# FUNCIONES DE CORREO INICIAL
+#----------------------------------------------
 def enviar_inicio():
     """Envía el aviso inicial habilitado y aplica sus intentos antes de iniciar el negocio."""
     if not (configuracion.MODULO_CORREO and configuracion.MODULO_CORREO_INICIAL):
@@ -71,51 +82,82 @@ def enviar_inicio():
     return ejecutar_modulo('Módulo 1 - Correo inicial', enviar, configuracion.MAX_REINTENTOS_CORREO)
 
 
+#----------------------------------------------
+# FUNCIONES DE EJECUCIÓN LOCAL
+#----------------------------------------------
 def ejecutar_local(productos_json=None, *, preparado=False):
     """Flujo de negocio local o subproceso de una solicitud web."""
-    if not preparado:
-        preparar_proceso(remoto=productos_json is not None)
-    logger = configuracion.obtener_logger('PROCESO')
-    notifica_web = configuracion.obtener_booleano('WEYLAND_CORREO_COORDINADOR', False)
-    logger.info('INICIO DEL PROCESO')
-    try:
-        # Módulo 1: una activación conserva el mismo identificador de correo.
-        if not notifica_web:
-            enviar_inicio()
+    with supermercados.sesion_automatizacion():
+        if not preparado:
+            preparar_proceso(remoto=productos_json is not None)
+        logger = configuracion.obtener_logger('PROCESO')
+        notifica_web = configuracion.obtener_booleano('WEYLAND_CORREO_COORDINADOR', False)
+        logger.info('INICIO DEL PROCESO')
+        try:
+            # Módulo 1: una activación conserva el mismo identificador de correo.
+            if not notifica_web:
+                enviar_inicio()
 
-        # Módulo 2: carga validada y consultas. Los reintentos son por tarea.
-        carga = (supermercados.cargar_productos_json_a_tabla_cola(productos_json)
-                 if productos_json else supermercados.cargar_excel_a_tabla_cola())
-        resumen = supermercados.procesar_cola_a_resultados(ejecutar_modulo)
-        resumen = dict(resumen or {'ok': 0, 'errores': 0, 'fallos': [], 'capturas': []}, carga=carga)
-        observaciones = min(resumen['errores'], sum(supermercados.es_observacion_busqueda(f[2])
-                                                   for f in resumen.get('fallos', [])))
-        resumen['observaciones'] = observaciones
-        resumen['errores_tecnicos'] = resumen['errores'] - observaciones + carga['archivos_error']
-        resumen['estado'] = ('con_errores' if resumen['errores_tecnicos'] else
-                             'completado_con_observaciones' if observaciones else 'completado')
+            # Módulo 2: completar un archivo antes de cargar y consultar el siguiente.
+            archivos = ([Path(productos_json)] if productos_json else supermercados.listar_archivos_entrada())
+            resumen = {'ok': 0, 'errores': 0, 'fallos': [], 'capturas': [], 'carga': {
+                'archivos_leidos': 0, 'archivos_error': 0, 'tareas_agregadas': 0, 'tareas_existentes': 0}}
+            with base_datos.ambito_archivos(archivos):
+                for numero, archivo in enumerate(archivos, start=1):
+                    logger.info('Procesando archivo %s de %s: %s', numero, len(archivos), archivo.name)
+                    with base_datos.ambito_archivos([archivo]):
+                        carga = (supermercados.cargar_productos_json_a_tabla_cola(archivo)
+                                 if productos_json else supermercados.cargar_excel_a_tabla_cola(archivo))
+                        parcial = (supermercados.procesar_cola_a_resultados(ejecutar_modulo)
+                                   if not carga['archivos_error'] else None)
+                    for campo in resumen['carga']:
+                        resumen['carga'][campo] += carga[campo]
+                    if parcial:
+                        resumen['ok'] += parcial['ok']
+                        resumen['errores'] += parcial['errores']
+                        resumen['fallos'].extend(parcial.get('fallos', []))
+                        resumen['capturas'].extend(parcial.get('capturas', []))
+                resumen['capturas'] = list(dict.fromkeys(resumen['capturas']))
+                observaciones = min(resumen['errores'], sum(supermercados.es_observacion_busqueda(f[2])
+                                                           for f in resumen['fallos']))
+                resumen['observaciones'] = observaciones
+                resumen['errores_tecnicos'] = resumen['errores'] - observaciones + resumen['carga']['archivos_error']
+                resumen['estado'] = ('con_errores' if resumen['errores_tecnicos'] else
+                                     'completado_con_observaciones' if observaciones else 'completado')
 
-        # Módulo 3: reporte. Agregar aquí las siguientes etapas del proceso.
-        ejecutar_modulo('Módulo 3 - Reporte', lambda _: reportes.generar_resultados_excel(),
-                       configuracion.MAX_REINTENTOS)
-        if not notifica_web:
-            correo.notificar_resultado_procesamiento(resumen)
-        return resumen
-    except Exception:
-        logger.exception('PROCESO INTERRUMPIDO')
-        if not notifica_web:
-            correo.enviar_correo_error('No se pudo completar el proceso; revisar el log privado.',
-                                      supermercados.obtener_capturas())
-        raise
-    finally:
-        logger.info('FIN DEL PROCESO')
+                # Módulo 3: un único Excel consolidado para todos los archivos de la solicitud.
+                ejecutar_modulo('Módulo 3 - Reporte', lambda _: reportes.generar_resultados_excel(),
+                               configuracion.MAX_REINTENTOS)
+            if not notifica_web:
+                correo.notificar_resultado_procesamiento(resumen)
+            return resumen
+        except Exception:
+            logger.exception('PROCESO INTERRUMPIDO')
+            if not notifica_web:
+                correo.enviar_correo_error('No se pudo completar el proceso; revisar el log privado.',
+                                          supermercados.obtener_capturas())
+            raise
+        finally:
+            logger.info('FIN DEL PROCESO')
 
 
+#----------------------------------------------
+# FUNCIONES DE EJECUCIÓN WEB
+#----------------------------------------------
 def procesar_solicitud(carpeta, entrada, parametros):
-    """Adaptador de negocio: el cliente backend y los checkpoints están en config/."""
+    """Procesa un input, una secuencia de inputs o parámetros JSON y devuelve un único reporte."""
     rutas = RutasEjecucion(carpeta)
     with configuracion.contexto(json.loads(rutas.contexto.read_text(encoding='utf-8'))):
         argumentos = ['procesar']
+        entradas = ([Path(entrada)] if isinstance(entrada, (str, Path)) else
+                    list(entrada) if entrada is not None else [])
+        if entrada is not None:
+            if not entradas or any(not isinstance(p, Path) or p.is_symlink()
+                    or not p.resolve().is_relative_to(rutas.input.resolve()) for p in entradas):
+                raise ErrorWeyland('Las entradas no pertenecen a la carpeta de la solicitud')
+            disponibles = {p.resolve() for p in supermercados.listar_archivos_entrada(rutas.input)}
+            if disponibles != {p.resolve() for p in entradas}:
+                raise ErrorWeyland('La carpeta contiene entradas no confirmadas por la solicitud')
         if entrada is None:
             productos = parametros.get('productos', [parametros] if parametros.get('producto') else [])
             if isinstance(productos, str):
@@ -127,7 +169,9 @@ def procesar_solicitud(carpeta, entrada, parametros):
         rutas.reportes.mkdir(parents=True, exist_ok=True)
         variables = {**os.environ, 'RUTA_BASE': str(rutas.datos),
             'RUTA_HISTORICO': str(rutas.historico), 'RUTA_LOGS': str(rutas.logs),
-            'EXCEL_ENTRADA': str(entrada or rutas.input), 'EXCEL_SALIDA': str(rutas.reporte_excel),
+            'CARPETA_INPUTS': str(rutas.input),
+            'EXCEL_ENTRADA': str(entradas[0] if len(entradas) == 1 else rutas.input),
+            'EXCEL_SALIDA': str(rutas.reporte_excel),
             'CARPETA_CAPTURAS': str(rutas.capturas), 'CARPETA_DESCARGAS': str(rutas.descargas),
             'DB_PATH': str(rutas.base_datos), 'ID_EJECUCION': '',
             'WEYLAND_SOLICITUD_ID': str(carpeta.name),
@@ -183,6 +227,9 @@ def ejecutar_web():
     return diagnostico.codigo
 
 
+#----------------------------------------------
+# FUNCIONES DE RECUPERACIÓN DE CORREOS
+#----------------------------------------------
 def gestionar_correos(args):
     """Consulta o recupera destinatarios pendientes sin volver a ejecutar la automatización."""
     cola = correo.obtener_cola()
@@ -209,6 +256,9 @@ def gestionar_correos(args):
     return diagnostico.codigo
 
 
+#----------------------------------------------
+# ARGUMENTOS Y PUNTO DE ENTRADA
+#----------------------------------------------
 def argumentos(argv=None):
     """Interpreta los comandos y rechaza combinaciones de argumentos incompatibles."""
     parser = argparse.ArgumentParser(description='RPA de supermercados conectado a Weyland Automate')
@@ -233,63 +283,67 @@ def argumentos(argv=None):
 def main(argv=None):
     """Selecciona el modo, valida el arranque, impide ejecuciones simultáneas y devuelve el código de salida."""
     args = argumentos(argv)
-    if _ERROR_CARGA is not None:
+    if CARGA_INVALIDA:
         print('[CONFIGURACION_INVALIDA] Revisar .env y dependencias. No se inició el proceso.')
         return 2
     try:
-        if args.comando == 'api-verificar':
+        with base_datos.ambito_base_datos(), configuracion.ambito_identificacion():
+            if args.comando == 'api-verificar':
+                if not configuracion.BACKEND_ACTIVO:
+                    print('BACKEND_ACTIVO=false: no se realizarán peticiones al backend.')
+                    return 0
+                with crear_cliente_api() as cliente:
+                    cliente.verificar()
+                print('Conexión JWT BOT autenticada. No se tomó trabajo.')
+                return 0
+            if args.comando and args.comando.startswith('correos-'):
+                return gestionar_correos(args)
+            if (not configuracion.MODULO_AUTOMATIZACION_SUPERMERCADOS
+                    and args.comando in (None, 'procesar', 'web-procesar', 'cargar')):
+                print('MODULO_AUTOMATIZACION_SUPERMERCADOS=false: automatización desactivada')
+                return 0
             if not configuracion.BACKEND_ACTIVO:
-                print('BACKEND_ACTIVO=false: no se realizarán peticiones al backend.')
-                return 0
-            with crear_cliente_api() as cliente:
-                cliente.verificar()
-            print('Conexión JWT BOT autenticada, sin cookies ni CSRF. No se tomó trabajo.')
-            return 0
-        if args.comando and args.comando.startswith('correos-'):
-            return gestionar_correos(args)
-        if (not configuracion.MODULO_AUTOMATIZACION_SUPERMERCADOS
-                and args.comando in (None, 'procesar', 'web-procesar', 'cargar')):
-            print('MODULO_AUTOMATIZACION_SUPERMERCADOS=false: automatización desactivada')
-            return 0
-        if not configuracion.BACKEND_ACTIVO:
-            if args.comando == 'web-procesar' or args.productos_json is not None:
-                raise ValueError('BACKEND_ACTIVO=false: ejecutar sin parámetros para leer solo CARPETA_INPUTS')
-        web = configuracion.BACKEND_ACTIVO and (
-            args.comando == 'web-procesar' or args.comando is None and not args.productos_json)
-        local_input = not web and args.productos_json is None and args.comando in (None, 'procesar', 'cargar')
-        ambito = (base_datos.ambito_archivos(supermercados.listar_archivos_entrada())
-                  if local_input else nullcontext())
-        raiz_lock = configuracion.RUTA_BASE / '.runtime'
-        raiz_lock.mkdir(parents=True, exist_ok=True)
-        with configuracion.contexto(), bloqueo(raiz_lock / 'arranque.lock'), ambito:
-            if args.comando in ('estado', 'reporte', 'cargar'):
-                configuracion.configuracion_inicial()
-            else:
-                preparar_proceso(remoto=web or args.productos_json is not None)
-            if web:
-                return ejecutar_web()
-            if args.comando == 'cargar':
-                return 1 if supermercados.cargar_excel_a_tabla_cola()['archivos_error'] else 0
-            if args.comando == 'estado':
-                supermercados.ver_datos_en_tabla_cola()
-                return 0
-            if args.comando == 'reporte':
-                reportes.generar_resultados_excel()
-                return 0
-            resumen = ejecutar_local(args.productos_json, preparado=True)
-            return 0 if resumen['estado'] in ('completado', 'completado_con_observaciones') else 1
+                if args.comando == 'web-procesar' or args.productos_json is not None:
+                    raise ValueError('BACKEND_ACTIVO=false: ejecutar sin parámetros para leer solo CARPETA_INPUTS')
+            web = configuracion.BACKEND_ACTIVO and (
+                args.comando == 'web-procesar' or args.comando is None and not args.productos_json)
+            local_input = not web and args.productos_json is None and args.comando in (None, 'procesar', 'cargar')
+            ambito = (base_datos.ambito_archivos(supermercados.listar_archivos_entrada())
+                      if local_input else nullcontext())
+            raiz_lock = configuracion.RUTA_BASE / '.runtime'
+            raiz_lock.mkdir(parents=True, exist_ok=True)
+            with configuracion.contexto(), bloqueo(raiz_lock / 'arranque.lock'), ambito:
+                if args.comando in ('estado', 'reporte', 'cargar'):
+                    configuracion.configuracion_inicial()
+                else:
+                    preparar_proceso(remoto=web or args.productos_json is not None)
+                if web:
+                    return ejecutar_web()
+                if args.comando == 'cargar':
+                    return 1 if supermercados.cargar_excel_a_tabla_cola()['archivos_error'] else 0
+                if args.comando == 'estado':
+                    supermercados.ver_datos_en_tabla_cola()
+                    return 0
+                if args.comando == 'reporte':
+                    reportes.generar_resultados_excel()
+                    return 0
+                resumen = ejecutar_local(args.productos_json, preparado=True)
+                return 0 if resumen['estado'] in ('completado', 'completado_con_observaciones') else 1
     except Exception as error:
         if isinstance(error, ErrorCorreoInicial):
             diagnostico = Diagnostico(1, 'CORREO_INICIAL_FALLIDO', 'No se confirmó el correo inicial; el negocio no se inició.')
         else:
             diagnostico = diagnosticar_error(error, correo=bool(args.comando and args.comando.startswith('correos-')))
         with configuracion.contexto(getattr(error, 'contexto_trazabilidad', None)):
-            configuracion.obtener_logger('ORQUESTADOR').error(diagnostico.texto())
+            configuracion.obtener_logger('ORQUESTADOR', getattr(error, 'id_ejecucion_local', None)).error(diagnostico.texto())
         return diagnostico.codigo
 
 
 
 
+#----------------------------------------------
+# DIAGNÓSTICOS DE EJECUCIÓN
+#----------------------------------------------
 @dataclass(frozen=True)
 class Diagnostico:
     codigo: int
@@ -326,7 +380,7 @@ def diagnosticar_error(error, *, correo=False):
     status = getattr(error, 'status_code', None)
     if correo:
         return Diagnostico(9, 'CORREO_REQUIERE_REVISION', 'No se completo la gestion de correos. Revisar la cola; no se reinicio el negocio ni la entrega web.')
-    if isinstance(error, SinPendientes):
+    if isinstance(error, ErrorWeyland) and error.tipo == 'SIN_PENDIENTES':
         return diagnosticar_resultado({'fase': 'SIN_TRABAJO'})
     if status in (401, 403):
         mensaje = ('El backend rechazo la autenticacion. Revisar acceso JWT o sesion configurada.' if status == 401
@@ -346,9 +400,9 @@ def diagnosticar_error(error, *, correo=False):
         return Diagnostico(8, 'PROCESO_INTERRUMPIDO', 'Existe un procesamiento interrumpido. Se conserva la evidencia y no se repite automaticamente.')
     if fase in ('EXPORT_PENDIENTE', 'ENTREGA_LISTA'):
         return Diagnostico(7, 'EXPORT_PENDIENTE', 'El resultado no pudo prepararse o validarse para entrega. Se conserva el trabajo; no se repite el procesamiento.')
-    if isinstance(error, ErrorRedWeyland):
+    if isinstance(error, ErrorWeyland) and error.tipo == 'RED':
         return Diagnostico(4, 'BACKEND_NO_DISPONIBLE', 'No se pudo comunicar con el backend. Revisar conectividad; no repetir operaciones inciertas.')
-    if isinstance(error, ErrorHTTPWeyland) or status is not None:
+    if (isinstance(error, ErrorWeyland) and error.tipo == 'HTTP') or status is not None:
         return Diagnostico(4, 'BACKEND_RECHAZO', 'El backend rechazo la peticion. Revisar disponibilidad y contrato de la API.')
     if isinstance(error, ErrorWeyland):
         return Diagnostico(5, 'CONTRATO_O_CHECKPOINT_INVALIDO', 'La respuesta o el checkpoint no cumplen el contrato. Conservar los archivos y revisar antes de continuar.')

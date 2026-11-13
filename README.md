@@ -92,7 +92,7 @@ El ID y código del ejemplo deben corresponder a registros reales. Para producci
 
 Las credenciales estandarizadas son `WEYLAND_AUTOMATE_MVTESTING_USER` y `WEYLAND_AUTOMATE_MVTESTING_PWD`; empresa y VM se resuelven mediante `CREDENCIALES_EMPRESA` y `CREDENCIALES_VM`. No se utiliza API key en el arranque actual.
 
-El bot inicia sesión directamente con `POST /api/bot/sesion`, enviando correo, contraseña y el ID de máquina configurado. Conserva `access_token`, `refresh_token` y su vencimiento únicamente en memoria; envía `Authorization: Bearer <access_token>` a `/api/bot/*`. No llama a `/api/auth/csrf`, `/api/auth/login`, `/api/auth/perfil` ni `/api/auth/sesion` en este modo. El refresh rota ambos tokens; si su respuesta se pierde, no se reutiliza el anterior. Al cerrar el cliente se intenta cerrar la sesión BOT y siempre se limpian sus tokens.
+El bot inicia sesión directamente con `POST /api/bot/sesion`, enviando correo, contraseña y el ID de máquina configurado. Conserva `access_token`, `refresh_token` y su vencimiento únicamente en memoria; envía `Authorization: Bearer <access_token>` a `/api/bot/*`. El cliente utiliza exclusivamente la sesión JWT BOT. El refresh rota ambos tokens; si su respuesta se pierde, no se reutiliza el anterior. Al cerrar el cliente se intenta cerrar la sesión BOT y siempre se limpian sus tokens.
 
 El contrato actual toma una solicitud por invocación. Un HTTP 204 termina sin trabajo. No se reutiliza la última solicitud ni se inventan IDs. Se admiten `input: null` y productos JSON en parámetros cuando corresponda.
 
@@ -179,3 +179,27 @@ Con `false`, el mismo comando lee todos los Excel compatibles de `CARPETA_INPUTS
 `integraciones/supermercados.py` reúne el catálogo `CATALOGO_SUPERMERCADOS`, el puente `PUENTE_CHROME_JS`, la clase `ChromeRobot`, la lectura segura de Excel/JSON y las búsquedas. Cada función y método incluye su descripción mediante una docstring `"""..."""` como primera instrucción. Las URLs, esperas y límites se siguen leyendo de `.env`.
 
 `main.py` llama a `supermercados.validar_catalogo()`, las funciones de carga y `procesar_cola_a_resultados()`. `integraciones/reportes.py` reutiliza las funciones de formato literal y clasificación de incidencias del mismo módulo. El módulo de configuración valida los servicios técnicos y no importa la automatización.
+
+## Varios archivos de entrada en una solicitud
+
+El bot anuncia `soporta_multiples_inputs: true` en `POST /api/bot/ejecuciones/siguiente`. Lee la lista `inputs`, valida cada `archivo_id`, nombre y ruta y descarga cada archivo mediante `GET /api/bot/ejecuciones/{id}/input` con el parámetro `archivo_id`. No envía el JWT a URLs firmadas externas.
+
+Cada descarga tiene un nombre local independiente, aunque dos adjuntos tengan el mismo nombre original. Se conserva su tamaño y SHA-256 en el checkpoint; las descargas completas se verifican antes de volver a utilizarlas. Un lote incompleto o alterado no se entrega al negocio. Los checkpoints anteriores con un solo `input` siguen siendo admitidos.
+
+Los archivos se procesan secuencialmente: se carga un Excel, se completan sus consultas y después se continúa con el siguiente. Los reintentos quedan limitados a las tareas del archivo actual. Al finalizar se genera un único `resultados.xlsx` con los productos y las incidencias de todos los archivos. Se sube una sola entrega con un solo estado final y un resumen consolidado; los correos de la solicitud tampoco se multiplican por archivo.
+
+`BACKEND_MAX_INPUTS` limita la cantidad de adjuntos y `BACKEND_MAX_INPUTS_BYTES` su tamaño total descargado en bytes. Se mantienen los límites individuales `MAX_ARCHIVO`, `MAX_EXPANDIDO`, `MAX_FILAS` y `MAX_COLUMNAS`. Una comunicación o escritura incierta conserva la evidencia y mantiene las reglas de revisión del coordinador.
+
+## Funciones y sesiones de ejecución
+
+Las validaciones, lectores, búsquedas y reportes siguen siendo funciones. Los objetos con estado tienen un ciclo de vida propio: `autenticacion.py` administra los tokens mediante funciones y una sesión HTTP explícita, `SesionAutomatizacion` administra el navegador y las capturas, y `BaseDatosEjecucion` selecciona la base SQLite de la ejecución.
+
+`main()` delimita la base de datos y el ID local mediante `ambito_base_datos()` y `ambito_identificacion()`. `ejecutar_local()` y `diagnosticar()` delimitan el navegador con `sesion_automatizacion()`. Los recursos se cierran y los contextos anteriores se restauran también cuando ocurre una excepción. La creación del controlador de Chrome es diferida: importar un módulo no crea una sesión de navegador.
+
+Los `ContextVar` definidos en los módulos son claves estables de contexto; las instancias operativas y sus valores pertenecen a cada ejecución. No hay un navegador, lista de capturas, ruta SQLite o ID local mutable compartido como variable global. Para invocar directamente funciones de automatización desde otro programa, usar `with sesion_automatizacion():`; para operar con otra SQLite, usar `with ambito_base_datos(ruta):`.
+
+## Error de integración unificado
+
+La conexión usa una sola excepción, `ErrorWeyland`, con `tipo` (`HTTP`, `RED`, `CONTRATO`, `ASIGNACION_INCOMPATIBLE` o `SIN_PENDIENTES`), `status_code` y `ejecucion_id` cuando corresponden. El coordinador distingue las categorías para conservar checkpoints y evitar operaciones duplicadas. HTTP 204 sin trabajo sigue siendo una finalización normal.
+
+La autenticación del frontend y la compatibilidad con API key fueron retiradas del cliente; se mantienen login, refresh y cierre JWT sobre `/api/bot/*`.

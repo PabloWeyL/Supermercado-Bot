@@ -4,27 +4,66 @@ import sqlite3
 from contextlib import closing, contextmanager
 from contextvars import ContextVar
 from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
 
-_ruta_db = None
-_archivos_entrada = ContextVar('archivos_entrada', default=None)
+# Claves estables: el valor operativo pertenece al contexto de cada ejecución.
+BASE_DATOS_ACTUAL = ContextVar('base_datos_actual', default=None)
+ARCHIVOS_ENTRADA = ContextVar('archivos_entrada', default=None)
+
+
+#----------------------------------------------
+# SESIÓN DE BASE DE DATOS POR EJECUCIÓN
+#----------------------------------------------
+@dataclass(frozen=True)
+class BaseDatosEjecucion:
+    ruta: Path
+
+    def conectar(self):
+        """Abre una conexión a esta base y activa las claves foráneas."""
+        conexion = conectar_sqlite(self.ruta)
+        conexion.execute('PRAGMA foreign_keys = ON')
+        return conexion
 
 
 @contextmanager
+def ambito_base_datos(ruta=None):
+    """Aísla la selección de SQLite y restaura la anterior al salir, incluso ante errores."""
+    token = BASE_DATOS_ACTUAL.set(None)
+    try:
+        if ruta is not None:
+            configurar_base_datos(ruta)
+        yield
+    finally:
+        BASE_DATOS_ACTUAL.reset(token)
+
+
+def obtener_base_datos():
+    """Exige una sesión SQLite configurada en el contexto actual."""
+    base = BASE_DATOS_ACTUAL.get()
+    if base is None:
+        raise RuntimeError('La base de datos no esta configurada.')
+    return base
+
+
+#----------------------------------------------
+# FUNCIONES DE ÁMBITO DE ARCHIVOS
+#----------------------------------------------
+@contextmanager
 def ambito_archivos(rutas):
     """Limita consultas y reportes a los archivos locales seleccionados, sin borrar historia."""
-    token = _archivos_entrada.set(tuple(dict.fromkeys(str(Path(r).resolve()) for r in rutas)))
+    token = ARCHIVOS_ENTRADA.set(tuple(dict.fromkeys(str(Path(r).resolve()) for r in rutas)))
     try:
         yield
     finally:
-        _archivos_entrada.reset(token)
+        ARCHIVOS_ENTRADA.reset(token)
 
 
-def _filtro_archivos(alias='cola'):
+def filtro_archivos(alias='cola'):
     """Construye el filtro parametrizado que limita las consultas a los inputs del contexto actual."""
-    rutas = _archivos_entrada.get()
+    rutas = ARCHIVOS_ENTRADA.get()
     if rutas is None:
         return '', ()
     if not rutas:
@@ -33,6 +72,9 @@ def _filtro_archivos(alias='cola'):
     return f' AND {alias}.detail_id IN (SELECT id FROM details WHERE ruta IN ({marcadores}))', rutas
 
 
+#----------------------------------------------
+# FUNCIONES DE CONEXIÓN A LA BASE DE DATOS
+#----------------------------------------------
 def conectar_sqlite(*args, **kwargs):
     """Abre SQLite con el tiempo límite centralizado, sin duplicar su configuración."""
     from config.configuracion import DB_TIMEOUT
@@ -41,27 +83,30 @@ def conectar_sqlite(*args, **kwargs):
 
 def configurar_base_datos(ruta_db):
     """Selecciona la base operativa, crea su carpeta e inicializa su estructura."""
-    global _ruta_db
-    _ruta_db = Path(ruta_db)
-    _ruta_db.parent.mkdir(parents=True, exist_ok=True)
-    inicializar_bd()
+    base = BaseDatosEjecucion(Path(ruta_db))
+    base.ruta.parent.mkdir(parents=True, exist_ok=True)
+    token = BASE_DATOS_ACTUAL.set(base)
+    try:
+        inicializar_bd()
+    except Exception:
+        BASE_DATOS_ACTUAL.reset(token)
+        raise
 
 
 def obtener_db_conexion_sql3():
     """Abre la base seleccionada y activa la verificación de claves foráneas."""
-    if _ruta_db is None:
-        raise RuntimeError('La base de datos no esta configurada.')
-    conexion = conectar_sqlite(_ruta_db)
-    conexion.execute('PRAGMA foreign_keys = ON')
-    return conexion
+    return obtener_base_datos().conectar()
 
 
-def _columnas(conexion, tabla):
+#----------------------------------------------
+# FUNCIONES DE ESQUEMA Y MIGRACIONES
+#----------------------------------------------
+def obtener_columnas(conexion, tabla):
     """Consulta los nombres de columnas de una tabla durante la validación o migración."""
     return {fila[1] for fila in conexion.execute('PRAGMA table_info(' + tabla + ')')}
 
 
-def _crear_tablas(conexion, prefijo=''):
+def crear_tablas(conexion, prefijo=''):
     """Crea las tablas de archivos, tareas y resultados con sus restricciones."""
     conexion.execute(f'''
         CREATE TABLE IF NOT EXISTS {prefijo}details (
@@ -104,16 +149,17 @@ def _crear_tablas(conexion, prefijo=''):
     ''')
 
 
-def _migrar_estructura_anterior(conexion):
+def migrar_estructura_anterior(conexion):
     """Respalda y convierte el esquema antiguo dentro de una transacción recuperable."""
-    copia = _ruta_db.with_name(_ruta_db.name + '.pre_v2_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '_' + uuid4().hex[:8] + '.bak')
+    ruta_db = obtener_base_datos().ruta
+    copia = ruta_db.with_name(ruta_db.name + '.pre_v2_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '_' + uuid4().hex[:8] + '.bak')
     with closing(conectar_sqlite(copia)) as destino:
         conexion.backup(destino)
     conexion.execute('PRAGMA foreign_keys = OFF')
     try:
         conexion.execute('BEGIN IMMEDIATE')
-        _crear_tablas(conexion, '_v2_')
-        archivo_id = 'cola_id' if 'cola_id' in _columnas(conexion, 'details') else 'NULL'
+        crear_tablas(conexion, '_v2_')
+        archivo_id = 'cola_id' if 'cola_id' in obtener_columnas(conexion, 'details') else 'NULL'
         conexion.execute('''
             INSERT INTO _v2_details (id, archivo, estado, error, fecha_creacion, fecha_fin)
             SELECT id, archivo, CASE WHEN estado='error' THEN 'error' ELSE 'leido' END,
@@ -125,7 +171,7 @@ def _migrar_estructura_anterior(conexion):
                 CASE WHEN estado='ok' THEN 'leido' ELSE estado END,
                 reintentos, error, fecha_creacion, fecha_fin FROM details
         ''')
-        columnas_resultados = _columnas(conexion, 'resultados')
+        columnas_resultados = obtener_columnas(conexion, 'resultados')
         if columnas_resultados:
             tarea_id = next((nombre for nombre in ('detail_id', 'details_id') if nombre in columnas_resultados), 'NULL')
             conexion.execute(f'''
@@ -148,9 +194,10 @@ def _migrar_estructura_anterior(conexion):
         conexion.execute('PRAGMA foreign_keys = ON')
 
 
-def _migrar_filtros(conexion):
+def migrar_filtros(conexion):
     """Respalda y migra las tareas para incorporar marca y rango de precios."""
-    copia = _ruta_db.with_name(_ruta_db.name + '.pre_v3_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '_' + uuid4().hex[:8] + '.bak')
+    ruta_db = obtener_base_datos().ruta
+    copia = ruta_db.with_name(ruta_db.name + '.pre_v3_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '_' + uuid4().hex[:8] + '.bak')
     with closing(conectar_sqlite(copia)) as destino:
         conexion.backup(destino)
     conexion.execute('PRAGMA foreign_keys = OFF')
@@ -182,12 +229,12 @@ def _migrar_filtros(conexion):
 def inicializar_bd():
     """Detecta migraciones pendientes y asegura el esquema, los índices y las restricciones."""
     with closing(obtener_db_conexion_sql3()) as conexion:
-        if 'producto' in _columnas(conexion, 'details') and 'archivo' in _columnas(conexion, 'cola'):
-            _migrar_estructura_anterior(conexion)
-        if _columnas(conexion, 'cola') and 'marca' not in _columnas(conexion, 'cola'):
-            _migrar_filtros(conexion)
+        if 'producto' in obtener_columnas(conexion, 'details') and 'archivo' in obtener_columnas(conexion, 'cola'):
+            migrar_estructura_anterior(conexion)
+        if obtener_columnas(conexion, 'cola') and 'marca' not in obtener_columnas(conexion, 'cola'):
+            migrar_filtros(conexion)
         with conexion:
-            _crear_tablas(conexion)
+            crear_tablas(conexion)
             for sql in (
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_cola_filtros ON cola(detail_id, producto, supermercado, marca, COALESCE(precio_minimo, -1), COALESCE(precio_maximo, -1))",
                 'CREATE INDEX IF NOT EXISTS idx_details_estado ON details(estado)',
@@ -200,6 +247,9 @@ def inicializar_bd():
             conexion.execute('PRAGMA user_version = 3')
 
 
+#----------------------------------------------
+# FUNCIONES DE REGISTRO Y ACTUALIZACIÓN DE ESTADOS
+#----------------------------------------------
 def registrar_archivo(ruta, fecha):
     """Registra o recupera el archivo por su ruta y reinicia su estado de lectura."""
     ruta = Path(ruta).resolve()
@@ -227,6 +277,9 @@ def actualizar_cola(id_tarea, estado, reintentos, fecha_fin=None, error=None):
         conexion.execute('UPDATE cola SET estado=?, reintentos=?, fecha_fin=?, error=? WHERE id=?', (estado, reintentos, fecha_fin, error, id_tarea))
 
 
+#----------------------------------------------
+# FUNCIONES DE RESULTADOS Y REPROCESO
+#----------------------------------------------
 def guardar_resultados(id_tarea, supermercado, producto, resultados, reintentos, fecha):
     """Guarda los productos y marca la tarea como leída en la misma transacción."""
     if not resultados:
@@ -243,12 +296,15 @@ def guardar_resultados(id_tarea, supermercado, producto, resultados, reintentos,
 
 def reencolar_errores():
     """Rehabilita las tareas fallidas del ámbito actual para volver a consultarlas."""
-    filtro, parametros = _filtro_archivos()
+    filtro, parametros = filtro_archivos()
     with closing(obtener_db_conexion_sql3()) as conexion, conexion:
         cursor = conexion.execute("UPDATE cola SET estado='pendiente', reintentos=0, error=NULL, fecha_fin=NULL WHERE estado='error'" + filtro, parametros)
         return cursor.rowcount
 
 
+#----------------------------------------------
+# FUNCIONES DE CARGA Y CONSULTA DE TAREAS
+#----------------------------------------------
 def guardar_tareas_entrada(archivo_id, tareas_validadas, fecha):
     """Inserta las tareas validadas sin duplicarlas y confirma la lectura del archivo."""
     agregadas = omitidas = 0
@@ -271,7 +327,7 @@ def guardar_tareas_entrada(archivo_id, tareas_validadas, fecha):
 
 def tareas_pendientes():
     """Obtiene las consultas pendientes de los archivos incluidos en el ámbito actual."""
-    filtro, parametros = _filtro_archivos()
+    filtro, parametros = filtro_archivos()
     with closing(obtener_db_conexion_sql3()) as conexion:
         return conexion.execute(
             "SELECT id, supermercado, producto, marca, precio_minimo, precio_maximo "
@@ -280,14 +336,17 @@ def tareas_pendientes():
 
 def tareas_con_error():
     """Obtiene las incidencias de las tareas del ámbito actual."""
-    filtro, parametros = _filtro_archivos()
+    filtro, parametros = filtro_archivos()
     with closing(obtener_db_conexion_sql3()) as conexion:
         return conexion.execute("SELECT producto, supermercado, error FROM cola WHERE estado='error'" + filtro + " ORDER BY id", parametros).fetchall()
 
 
+#----------------------------------------------
+# FUNCIONES DE REPORTES Y DIAGNÓSTICO
+#----------------------------------------------
 def datos_reporte():
     """Reúne productos e incidencias para el reporte, respetando el ámbito de entrada."""
-    filtro, parametros = _filtro_archivos('c')
+    filtro, parametros = filtro_archivos('c')
     with closing(obtener_db_conexion_sql3()) as conexion:
         encontrados = conexion.execute(
             "SELECT r.producto, r.nombre, r.precio, r.url, r.fecha, r.supermercado, "
@@ -326,6 +385,6 @@ def consultar_estado_cola():
 
 def supermercados_por_validar():
     """Obtiene las tiendas de tareas pendientes o fallidas del ámbito actual."""
-    filtro, parametros = _filtro_archivos()
+    filtro, parametros = filtro_archivos()
     with closing(obtener_db_conexion_sql3()) as conexion:
         return conexion.execute("SELECT DISTINCT supermercado FROM cola WHERE estado IN ('pendiente','error')" + filtro, parametros).fetchall()

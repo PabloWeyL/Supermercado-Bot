@@ -5,8 +5,8 @@ import json
 import os
 import re
 import requests
+from config import autenticacion
 from config.archivos import (
-    ErrorRedWeyland,
     ErrorWeyland,
     RUTA_ARCHIVO_EJECUCION,
     RUTA_BOT_ERROR,
@@ -21,7 +21,6 @@ from config.archivos import (
     reemplazar_atomico,
 )
 from config.autenticacion import (
-    SesionWeyland,
     configuracion_desde_valores,
     exigir_estado,
     leer_json,
@@ -30,6 +29,9 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 
+#----------------------------------------------
+# FUNCIONES DE VALIDACIÓN DEL CONTRATO
+#----------------------------------------------
 def id_positivo(valor):
     """Exige un identificador entero positivo y rechaza booleanos u otros tipos."""
     if type(valor) is not int or valor < 1:
@@ -42,7 +44,7 @@ def hash_valido(valor):
     return isinstance(valor, str) and re.fullmatch(r'[a-f0-9]{64}', valor) is not None
 
 
-from config.configuracion import BACKEND_MAX_BYTES as MAX_BYTES, BACKEND_MAX_PAGINAS
+from config.configuracion import BACKEND_MAX_BYTES as MAX_BYTES, BACKEND_MAX_PAGINAS, BACKEND_MAX_INPUTS
 
 
 def entero_configurado(valores, nombre, defecto=None):
@@ -53,6 +55,9 @@ def entero_configurado(valores, nombre, defecto=None):
     return int(valor)
 
 
+#----------------------------------------------
+# FUNCIONES DE POLÍTICA DE CORREOS Y DATOS PUBLICABLES
+#----------------------------------------------
 def leer_notificar_correo(configuracion):
     """Booleano web opcional. None conserva el interruptor local del bot.
 
@@ -93,22 +98,81 @@ def validar_datos_publicables(datos, profundidad=0):
         validar_datos_publicables(interpretado, profundidad + 1)
 
 
-class ClienteColaWeyland(SesionWeyland):
+#----------------------------------------------
+# CLIENTE DE LA COLA DEL BACKEND
+#----------------------------------------------
+class ClienteColaWeyland:
     """No reutiliza los POST por ID ni presupone idempotencia del servidor."""
 
     def __init__(self, config, session=None, *, max_input_bytes=MAX_BYTES, empresa_id=None):
         """Inicializa el transporte, el límite de descarga y el contexto opcional de empresa."""
-        super().__init__(config, session)
         self.max_input_bytes = entero_configurado({'limite': max_input_bytes}, 'limite')
         self.empresa_id = id_positivo(empresa_id) if empresa_id is not None else None
+        self.config = config
+        self.sesion = autenticacion.crear_sesion(config, session=session)
 
+    #----------------------------------------------
+    # SESIÓN JWT Y MÉTODOS HTTP PÚBLICOS
+    #----------------------------------------------
+    def __enter__(self):
+        """Entrega el cliente dentro de un bloque with."""
+        return self
+
+    def __exit__(self, *_):
+        """Cierra la sesión al salir del contexto."""
+        self.cerrar()
+
+    def login(self):
+        """Inicia o reutiliza JWT mediante el módulo funcional."""
+        return autenticacion.login(self.sesion)
+
+    def refrescar(self):
+        """Renueva JWT sin exponer los tokens al negocio."""
+        return autenticacion.refrescar(self.sesion)
+
+    def cerrar(self):
+        """Revoca y limpia la sesión HTTP y sus tokens."""
+        return autenticacion.cerrar(self.sesion)
+
+    def verificar(self):
+        """Comprueba el acceso JWT sin tomar solicitudes."""
+        return autenticacion.verificar(self.sesion)
+
+    @property
+    def cierre_remoto_confirmado(self):
+        """Indica si el backend confirmó el cierre de esta sesión."""
+        return self.sesion._weyland['cierre_remoto_confirmado']
+
+    def solicitar(self, metodo, ruta, **opciones):
+        """Delega validación, Bearer y renovación en el transporte funcional común."""
+        return autenticacion.solicitar(self.sesion, metodo, ruta, **opciones)
+
+    def get(self, ruta, *, params=None, **opciones):
+        """Consulta una ruta relativa y devuelve la respuesta HTTP para cerrar con with."""
+        return self.solicitar('GET', ruta, params=params, **opciones)
+
+    def post(self, ruta, *, json=None, files=None, data=None, params=None, **opciones):
+        """Envía JSON o archivos multipart mediante el transporte autenticado común."""
+        return self.solicitar('POST', ruta, datos=json, archivos=files, formulario=data, params=params, **opciones)
+
+    def put(self, ruta, *, json=None, files=None, data=None, params=None, **opciones):
+        """Envía una sustitución a una ruta que el backend admita mediante PUT."""
+        return self.solicitar('PUT', ruta, datos=json, archivos=files, formulario=data, params=params, **opciones)
+
+    def patch(self, ruta, *, json=None, files=None, data=None, params=None, **opciones):
+        """Envía una actualización parcial a una ruta habilitada para PATCH."""
+        return self.solicitar('PATCH', ruta, datos=json, archivos=files, formulario=data, params=params, **opciones)
+
+    #----------------------------------------------
+    # FUNCIONES DE ESTADOS Y ASIGNACIÓN
+    #----------------------------------------------
     def consultar_estados(self):
         """Consulta explícita del catálogo cuando el despliegue lo habilite.
 
         Devuelve el catálogo web (listas ejecucion y bot). No se invoca para
         tomar trabajo ni se guarda la respuesta completa en el checkpoint.
         """
-        with self.solicitar('GET', RUTA_CATALOGO_ESTADOS, empresa_id=self.empresa_id) as respuesta:
+        with self.get(RUTA_CATALOGO_ESTADOS, empresa_id=self.empresa_id) as respuesta:
             exigir_estado(respuesta)
             try:
                 datos = respuesta.json()
@@ -123,8 +187,9 @@ class ClienteColaWeyland(SesionWeyland):
         id_positivo(maquina_id)
         if not isinstance(id_externo, str) or not re.fullmatch(r'[a-f0-9]{32}', id_externo):
             raise ValueError('id_externo debe ser la correlacion local persistida')
-        with self.solicitar('POST', RUTA_SIGUIENTE,
-                datos={'maquina_id': maquina_id, 'id_externo': id_externo}) as respuesta:
+        with self.post(RUTA_SIGUIENTE,
+                json={'maquina_id': maquina_id, 'id_externo': id_externo,
+                      'soporta_multiples_inputs': True}) as respuesta:
             if respuesta.status_code == 204:
                 return None
             exigir_estado(respuesta)
@@ -138,15 +203,33 @@ class ClienteColaWeyland(SesionWeyland):
                 or not isinstance(datos.get('maquina'), dict)
                 or type(datos['maquina'].get('id')) is not int or datos['maquina']['id'] != maquina_id
                 or not isinstance(datos.get('proceso'), dict) or datos['proceso'].get('codigo') not in codigos
-                or not isinstance(datos.get('parametros'), dict) or 'input' not in datos):
+                or not isinstance(datos.get('parametros'), dict)
+                or not any(k in datos for k in ('input', 'inputs'))):
             raise ErrorWeyland('Asignacion incompatible con VM, correlacion, proceso o parametros')
-        entrada = datos['input']
-        if entrada is not None:
+        multiples = 'inputs' in datos
+        entradas = datos['inputs'] if multiples else ([datos['input']] if datos['input'] is not None else [])
+        if not isinstance(entradas, list) or len(entradas) > BACKEND_MAX_INPUTS:
+            raise ErrorWeyland('Lista de inputs invalida o superior al limite configurado')
+        normalizadas, vistos = [], set()
+        for entrada in entradas:
             nombre = entrada.get('nombre') if isinstance(entrada, dict) else None
+            archivo_id = entrada.get('archivo_id') if isinstance(entrada, dict) else None
+            ruta = RUTA_BOT_INPUT_API.format(identificador=datos['ejecucion_id'])
+            if multiples:
+                if type(archivo_id) is not int or archivo_id < 1 or archivo_id in vistos:
+                    raise ErrorWeyland('ID de archivo de input invalido o repetido')
+                vistos.add(archivo_id)
+                ruta += '?archivo_id=' + str(archivo_id)
             if (not isinstance(nombre, str) or not nombre or len(nombre) > 255
                     or any(c in nombre for c in '/\\:\x00\r\n')
-                    or entrada.get('descarga') != RUTA_BOT_INPUT_API.format(identificador=datos["ejecucion_id"])):
+                    or entrada.get('descarga') != ruta):
                 raise ErrorWeyland('Metadatos de input incompatibles')
+            item = {'nombre': nombre, 'descarga': ruta}
+            if multiples:
+                item['archivo_id'] = archivo_id
+            normalizadas.append(item)
+        if multiples and not entradas and datos.get('input') is not None:
+            raise ErrorWeyland('El input legacy contradice la lista vacia de inputs')
         validar_datos_publicables(datos['parametros'])
         if len(json.dumps(datos['parametros'], allow_nan=False).encode()) > MAX_BYTES:
             raise ErrorWeyland('Parametros demasiado grandes')
@@ -159,15 +242,19 @@ class ClienteColaWeyland(SesionWeyland):
                 'maquina_id': maquina_id, 'proceso_codigo': datos['proceso']['codigo'],
                 'parametros': datos['parametros'],
                 'notificar_correo': leer_notificar_correo(datos.get('configuracion')),
-                'input': {'nombre': entrada['nombre'], 'descarga': entrada['descarga']} if entrada else None}
+                'input': normalizadas[0] if len(normalizadas) == 1 else None,
+                'inputs': normalizadas}
 
-    def _descargar(self, ruta, destino, limite, *, usuario=False):
+    #----------------------------------------------
+    # FUNCIONES DE DESCARGA DE INPUTS
+    #----------------------------------------------
+    def descargar(self, ruta, destino, limite, *, usuario=False, params=None):
         """Descarga en un archivo parcial, verifica su tamaño y lo publica mediante sustitución atómica."""
         destino = Path(destino)
         destino.parent.mkdir(parents=True, exist_ok=True)
         parcial = None
         try:
-            with self.solicitar('GET', ruta, stream=True,
+            with self.get(ruta, stream=True, params=params,
                     empresa_id=self.empresa_id if usuario else None) as respuesta:
                 exigir_estado(respuesta)
                 cabecera = respuesta.headers.get('Content-Length')
@@ -188,20 +275,25 @@ class ClienteColaWeyland(SesionWeyland):
                     archivo.flush()
                     os.fsync(archivo.fileno())
                 if total < 1 or esperado is not None and total != esperado:
-                    raise ErrorRedWeyland('Descarga incompleta; conservar el mismo ID')
+                    raise ErrorWeyland('Descarga incompleta; conservar el mismo ID', tipo='RED')
             reemplazar_atomico(parcial, destino)
             return {'size_bytes': total, 'sha256': digest.hexdigest()}
         except requests.RequestException:
-            raise ErrorRedWeyland('Descarga interrumpida; no ejecutar un parcial') from None
+            raise ErrorWeyland('Descarga interrumpida; no ejecutar un parcial', tipo='RED') from None
         finally:
             if parcial is not None:
                 parcial.unlink(missing_ok=True)
 
-    def descargar_input(self, identificador, destino):
-        """Descarga la entrada del ID indicado aplicando el límite configurado."""
+    def descargar_input(self, identificador, destino, *, archivo_id=None):
+        """Descarga un input concreto mediante su ID o el primero en el contrato legacy."""
         id_positivo(identificador)
-        return self._descargar(RUTA_BOT_INPUT.format(identificador=identificador), destino, self.max_input_bytes)
+        params = {'archivo_id': id_positivo(archivo_id)} if archivo_id is not None else None
+        return self.descargar(RUTA_BOT_INPUT.format(identificador=identificador), destino,
+                               self.max_input_bytes, params=params)
 
+    #----------------------------------------------
+    # FUNCIONES DE ENTREGA DE RESULTADOS
+    #----------------------------------------------
     def entregar_resultado(self, identificador, reporte, huella, tamano, *, estado_bot=None, mensaje='', resumen=None):
         """Verifica el reporte, lo sube con su estado final y exige una confirmación compatible."""
         id_positivo(identificador)
@@ -222,8 +314,8 @@ class ClienteColaWeyland(SesionWeyland):
             if os.fstat(archivo.fileno()).st_size != tamano or hashlib.file_digest(archivo, 'sha256').hexdigest() != huella:
                 raise ErrorWeyland('La entrega cambio; no se enviara')
             archivo.seek(0)
-            with self.solicitar('POST', RUTA_BOT_REPORTE.format(identificador=identificador),
-                    archivos={'archivo': (reporte.name, archivo, mime)}, formulario=formulario) as respuesta:
+            with self.post(RUTA_BOT_REPORTE.format(identificador=identificador),
+                    files={'archivo': (reporte.name, archivo, mime)}, data=formulario) as respuesta:
                 exigir_estado(respuesta)
                 confirmado = leer_json(respuesta)
         self.validar_confirmacion(confirmado, identificador, 'COMPLETADA')
@@ -231,6 +323,9 @@ class ClienteColaWeyland(SesionWeyland):
             from config.ejecuciones import validar_confirmacion_estado
             validar_confirmacion_estado(confirmado, identificador, estado_bot)
 
+    #----------------------------------------------
+    # FUNCIONES DE ACTUALIZACIÓN DE ESTADOS
+    #----------------------------------------------
     def informar_estado(self, identificador, estado, mensaje='', resumen=None):
         """Valida y publica un estado del bot y comprueba el ID y el cierre confirmados."""
         from config.ejecuciones import validar_estado_bot, validar_confirmacion_estado
@@ -239,8 +334,7 @@ class ClienteColaWeyland(SesionWeyland):
         datos = {'estado': estado, 'mensaje': mensaje}
         if resumen is not None:
             datos['resumen'] = resumen
-        with self.solicitar('POST', RUTA_BOT_ESTADO.format(identificador=identificador),
-                datos=datos) as respuesta:
+        with self.post(RUTA_BOT_ESTADO.format(identificador=identificador), json=datos) as respuesta:
             exigir_estado(respuesta)
             validar_confirmacion_estado(leer_json(respuesta), identificador, estado)
 
@@ -256,14 +350,17 @@ class ClienteColaWeyland(SesionWeyland):
         id_positivo(identificador)
         if not isinstance(mensaje, str) or not mensaje.strip() or len(mensaje) > 4000:
             raise ValueError('Mensaje de error invalido')
-        with self.solicitar('POST', RUTA_BOT_ERROR.format(identificador=identificador), datos={'mensaje': mensaje}) as respuesta:
+        with self.post(RUTA_BOT_ERROR.format(identificador=identificador), json={'mensaje': mensaje}) as respuesta:
             exigir_estado(respuesta)
             self.validar_confirmacion(leer_json(respuesta), identificador, 'ERROR')
 
+    #----------------------------------------------
+    # FUNCIONES DE CONSULTA Y CONCILIACIÓN
+    #----------------------------------------------
     def consultar_ejecucion(self, identificador):
         """Normaliza el código BOT del detalle web, sin usar su etiqueta visible."""
         id_positivo(identificador)
-        with self.solicitar('GET', RUTA_DETALLE_EJECUCION.format(identificador=identificador), empresa_id=self.empresa_id) as respuesta:
+        with self.get(RUTA_DETALLE_EJECUCION.format(identificador=identificador), empresa_id=self.empresa_id) as respuesta:
             exigir_estado(respuesta)
             datos = leer_json(respuesta)
         if type(datos.get('id')) is not int or datos['id'] != identificador:
@@ -289,7 +386,7 @@ class ClienteColaWeyland(SesionWeyland):
             raise ValueError('Opciones de conciliacion invalidas')
         encontrados = []
         for pagina in range(1, limite_paginas + 1):
-            with self.solicitar('GET', RUTA_EJECUCIONES, params={'maquina_id': maquina_id, 'page': pagina},
+            with self.get(RUTA_EJECUCIONES, params={'maquina_id': maquina_id, 'page': pagina},
                     empresa_id=self.empresa_id) as respuesta:
                 exigir_estado(respuesta)
                 datos = leer_json(respuesta)
@@ -326,10 +423,13 @@ class ClienteColaWeyland(SesionWeyland):
         """Solicita el reporte del detalle web para conciliar su tamaño y huella con la entrega local."""
         id_positivo(identificador)
         id_positivo(archivo_id)
-        return self._descargar(RUTA_ARCHIVO_EJECUCION.format(identificador=identificador, archivo_id=archivo_id), destino,
+        return self.descargar(RUTA_ARCHIVO_EJECUCION.format(identificador=identificador, archivo_id=archivo_id), destino,
                                MAX_BYTES, usuario=True)
 
 
+#----------------------------------------------
+# FUNCIONES DE CONFIGURACIÓN Y CREACIÓN DEL CLIENTE
+#----------------------------------------------
 def crear_cliente_cola(valores, credenciales=None, session=None):
     """Construye el cliente del contrato de cola con sus credenciales y límites de entrada."""
     empresa_id = entero_configurado(valores, 'BACKEND_EMPRESA_ID') if valores.get('BACKEND_EMPRESA_ID') else None

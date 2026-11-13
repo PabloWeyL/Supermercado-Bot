@@ -1,6 +1,5 @@
 """Coordinación de solicitudes, estados, exportación y recuperación."""
 
-import hashlib
 import json
 import math
 import os
@@ -17,8 +16,6 @@ from config.archivos import (
     CARPETA_LOGS,
     CARPETA_PARAMETROS,
     EXTENSIONES_INPUT_POR_DEFECTO,
-    ErrorHTTPWeyland,
-    ErrorRedWeyland,
     ErrorWeyland,
     FORMATO_FECHA_ARCHIVO,
     RUTA_BOT_INPUT_API,
@@ -36,6 +33,7 @@ from config.backend import (
     id_positivo,
     validar_datos_publicables,
 )
+from config.configuracion import BACKEND_MAX_INPUTS_BYTES
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -44,6 +42,9 @@ from uuid import uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
 
 
+#----------------------------------------------
+# CONTRATO DEL RESULTADO DEL BOT
+#----------------------------------------------
 @dataclass(frozen=True)
 class ResultadoBot:
     """Salida del negocio: archivos, resumen y opciones de exportación."""
@@ -53,9 +54,9 @@ class ResultadoBot:
     permite_sin_export: bool = False
     incluir_metadatos_export: bool = True
 
-# # # # # # # 
-# FUNCIONES ESTADOS
-# # # # # # 
+#----------------------------------------------
+# FUNCIONES DE EXPORTACIÓN
+#----------------------------------------------
 def exportar(carpeta, resultado, estado):
     """Valida los artefactos y prepara el ZIP o los metadatos de un resultado sin exportación."""
     if not isinstance(resultado, ResultadoBot):
@@ -117,6 +118,9 @@ SISTEMA_POR_ESTADO = {
 }
 
 
+#----------------------------------------------
+# FUNCIONES ESTADOS
+#----------------------------------------------
 def validar_estado_bot(estado, mensaje, resumen):
     """Valida el código de estado, su mensaje y los valores publicables del resumen."""
     if estado not in SISTEMA_POR_ESTADO:
@@ -162,9 +166,9 @@ def publicar_estado(cliente, estado, journal, nuevo, mensaje, resumen=None):
     guardar_json(journal, estado)
     try:
         cliente.informar_estado(estado['ejecucion_id'], nuevo, mensaje, resumen)
-    except ErrorHTTPWeyland as error:
+    except ErrorWeyland as error:
         # Rechazo conocido: no afirmar que el cambio se aplico.
-        if error.status_code in (400, 401, 403, 404, 409, 422):
+        if error.tipo == 'HTTP' and error.status_code in (400, 401, 403, 404, 409, 422):
             estado.pop('estado_bot_pendiente')
             guardar_json(journal, estado)
         raise
@@ -173,6 +177,9 @@ def publicar_estado(cliente, estado, journal, nuevo, mensaje, resumen=None):
     guardar_json(journal, estado)
 
 
+#----------------------------------------------
+# FUNCIONES DE INTEGRIDAD Y EMPAQUETADO DEL RESULTADO
+#----------------------------------------------
 def snapshot_resultado(carpeta, resultado):
     """Valida la salida del negocio y registra rutas, tamaños y hashes para recuperarla sin repetirlo."""
     if not isinstance(resultado, ResultadoBot) or not isinstance(resultado.resumen, dict):
@@ -230,6 +237,9 @@ def empaquetar_resultado(carpeta, estado):
             'sha256': sha256(reporte)}
 
 
+#----------------------------------------------
+# CONTRATO DEL PROCESO
+#----------------------------------------------
 @dataclass(frozen=True)
 class ProcesoBot:
     """Contrato del adaptador de negocio y sus requisitos de entrada y estados."""
@@ -247,7 +257,10 @@ FASES = {'TOMA_INCIERTA', 'TOMA_RECHAZADA', 'SIN_TRABAJO', 'ASIGNACION_INCOMPATI
 FINALES = {'COMPLETADA', 'ERROR', 'SIN_TRABAJO', 'CANCELADO', 'INTERRUMPIDO', 'TOMA_RECHAZADA'}
 
 
-def _leer(ruta):
+#----------------------------------------------
+# FUNCIONES DE CHECKPOINT Y CONTEXTO DE ERROR
+#----------------------------------------------
+def leer(ruta):
     """Lee un checkpoint y detiene el flujo si es ilegible o no contiene un objeto JSON."""
     try:
         datos = json.loads(ruta.read_text(encoding='utf-8'))
@@ -259,7 +272,7 @@ def _leer(ruta):
 
 
 @contextmanager
-def _contexto_de_error():
+def contexto_de_error():
     """Añade fase e identificadores de trazabilidad a la excepción antes de propagarla."""
     referencia = {}
     try:
@@ -273,7 +286,7 @@ def _contexto_de_error():
         raise
 
 
-def _validar_estado(estado, identidad):
+def validar_checkpoint(estado, identidad):
     """Comprueba que el checkpoint pertenezca a la cuenta, backend, máquina y proceso actuales."""
     if (any(estado.get(k) != v for k, v in identidad.items()) or estado.get('fase') not in FASES
             or not isinstance(estado.get('id_externo'), str)
@@ -286,6 +299,9 @@ def _validar_estado(estado, identidad):
             raise ErrorWeyland('IDs incompatibles en el checkpoint')
 
 
+#----------------------------------------------
+# FUNCIONES DE POLÍTICA DE CORREOS
+#----------------------------------------------
 def correo_permitido(estado):
     """La politica de correo se congela al tomar el trabajo, incluidos reintentos.
 
@@ -300,7 +316,7 @@ def correo_permitido(estado):
     return valor is None or valor is True
 
 
-def _avisar(notificar, evento, estado, carpeta):
+def avisar(notificar, evento, estado, carpeta):
     """Aplica la política de correo; propaga fallos iniciales y conserva el cierre ante fallos finales."""
     if notificar is not None and correo_permitido(estado):
         try:
@@ -312,7 +328,10 @@ def _avisar(notificar, evento, estado, carpeta):
             pass
 
 
-def _asignar(cliente, datos, estado, procesos, base, journal):
+#----------------------------------------------
+# FUNCIONES DE ASIGNACIÓN Y RECUPERACIÓN DE SOLICITUDES
+#----------------------------------------------
+def asignar(cliente, datos, estado, procesos, base, journal):
     """Valida la solicitud recibida, prepara su carpeta y persiste el contexto y el checkpoint."""
     try:
         trabajo = cliente.validar_asignacion(datos, estado['maquina_id'], estado['id_externo'], procesos)
@@ -322,7 +341,7 @@ def _asignar(cliente, datos, estado, procesos, base, journal):
                     'activacion_id': estado['id_externo']}
         if carpeta.exists() and any(carpeta.iterdir()):
             ruta = carpeta / ARCHIVO_CONTEXTO
-            if not ruta.is_file() or _leer(ruta) != contexto:
+            if not ruta.is_file() or leer(ruta) != contexto:
                 raise ErrorWeyland('El ID ya tiene evidencia de otra activacion; no se repetira')
         carpeta.mkdir(parents=True, exist_ok=True)
         guardar_json(carpeta / ARCHIVO_CONTEXTO, contexto)
@@ -332,11 +351,12 @@ def _asignar(cliente, datos, estado, procesos, base, journal):
     except (ErrorWeyland, ValueError, TypeError):
         estado['fase'] = 'ASIGNACION_INCOMPATIBLE'
         guardar_json(journal, estado)
-        raise ErrorWeyland('La asignacion ya pudo ocurrir pero es incompatible; revisar la web, no tomar otra') from None
+        raise ErrorWeyland('La asignacion ya pudo ocurrir pero es incompatible; revisar la web, no tomar otra',
+                           tipo='ASIGNACION_INCOMPATIBLE') from None
     guardar_json(journal, estado)
 
 
-def _comprobar_detalle(datos, estado):
+def comprobar_detalle(datos, estado):
     """Verifica que el detalle remoto coincida con el ID, correlación, proceso y máquina locales."""
     if (datos.get('id') != estado['ejecucion_id'] or datos.get('id_externo') != estado['id_externo']
             or not isinstance(datos.get('proceso'), dict)
@@ -346,8 +366,8 @@ def _comprobar_detalle(datos, estado):
         raise ErrorWeyland('La conciliacion no coincide con la asignacion local')
 
 
-def _recuperar_toma(cliente, estado):
-    """Reconstruye una asignación incierta solo con una coincidencia remota y un input inequívoco."""
+def recuperar_toma(cliente, estado):
+    """Reconstruye una asignación incierta y sus inputs a partir de un detalle remoto inequívoco."""
     detalle = cliente.buscar_correlacion(estado['maquina_id'], estado['id_externo'])
     if detalle.get('estado') != 'EN_PROCESO':
         raise ErrorWeyland('Toma incierta en otro estado; requiere revision, no se repetira siguiente')
@@ -355,10 +375,8 @@ def _recuperar_toma(cliente, estado):
     if not isinstance(archivos, list):
         raise ErrorWeyland('Detalle sin archivos compatibles para recuperar la toma')
     entradas = [a for a in archivos if isinstance(a, dict) and a.get('tipo') == 'INPUT']
-    if len(entradas) > 1:
-        raise ErrorWeyland('Inputs ambiguos al recuperar una toma')
     identificador = id_positivo(detalle.get('id'))
-    return {'ejecucion_id': identificador, 'id_externo': detalle.get('id_externo'),
+    trabajo = {'ejecucion_id': identificador, 'id_externo': detalle.get('id_externo'),
             # El detalle de usuario no devuelve la configuracion de habilitacion.
             # Sin prueba de esa politica no enviar correos, aunque el negocio retome.
             'configuracion': {'notificar_correo': False},
@@ -368,11 +386,97 @@ def _recuperar_toma(cliente, estado):
             'input': {'nombre': entradas[0].get('nombre'),
                       'descarga': RUTA_BOT_INPUT_API.format(identificador=identificador)} if entradas else None}
 
+    if len(entradas) > 1:
+        trabajo['input'] = None
+        trabajo['inputs'] = [{'archivo_id': id_positivo(e.get('id')), 'nombre': e.get('nombre'),
+            'descarga': RUTA_BOT_INPUT_API.format(identificador=identificador) +
+                        '?archivo_id=' + str(id_positivo(e.get('id')))} for e in entradas]
+    return trabajo
 
-def _conciliar(cliente, estado, carpeta):
+
+#----------------------------------------------
+# FUNCIONES DE DESCARGA Y VALIDACIÓN DE ENTRADAS
+#----------------------------------------------
+def preparar_entradas(cliente, estado, carpeta, journal, proceso):
+    """Descarga todos los inputs y persiste cada huella sin sobrescribir archivos de igual nombre."""
+    trabajo = estado['trabajo']
+    entradas = trabajo.get('inputs')
+    if entradas is None:
+        entradas = [trabajo['input']] if trabajo['input'] else []
+    if (proceso.requiere_input is True and not entradas
+            or proceso.requiere_input is False and entradas):
+        raise ValueError('Modalidad de input no admitida')
+    for info in entradas:
+        if Path(info['nombre']).suffix.lower() not in proceso.extensiones:
+            raise ValueError('Extension de entrada no admitida')
+    descargados = estado.setdefault('inputs_descargados', [])
+    if len(descargados) > len(entradas):
+        raise ErrorWeyland('Checkpoint con inputs incompatibles')
+    total = 0
+    for numero, info in enumerate(entradas):
+        extension = Path(info['nombre']).suffix.lower()
+        archivo_id = info.get('archivo_id')
+        nombre = (RUTA_ENTRADA_BASE + extension if len(entradas) == 1 and archivo_id is None
+                  else RUTA_ENTRADA_BASE + f'_{numero + 1:06d}_{id_positivo(archivo_id)}' + extension)
+        destino = confinar(carpeta, nombre)
+        if numero < len(descargados):
+            guardado = descargados[numero]
+            if (guardado.get('ruta') != nombre or guardado.get('archivo_id') != archivo_id
+                    or destino.is_symlink() or not destino.is_file()
+                    or destino.stat().st_size != guardado['size_bytes']
+                    or sha256(destino) != guardado['sha256']):
+                raise ErrorWeyland('Un input descargado cambio; requiere revision')
+        else:
+            if total >= BACKEND_MAX_INPUTS_BYTES:
+                raise ValueError('Los inputs superan el limite total de descarga')
+            opciones = {'archivo_id': archivo_id} if archivo_id is not None else {}
+            snapshot = cliente.descargar_input(estado['ejecucion_id'], destino, **opciones)
+            guardado = {'ruta': nombre, 'archivo_id': archivo_id, **snapshot}
+            descargados.append(guardado)
+            guardar_json(journal, estado)
+        total += guardado['size_bytes']
+        if total > BACKEND_MAX_INPUTS_BYTES:
+            raise ValueError('Los inputs superan el limite total de descarga')
+    estado['entrada'] = descargados[0]['ruta'] if len(descargados) == 1 else None
+    if len(descargados) == 1:
+        estado['snapshot_input'] = {k: descargados[0][k] for k in ('size_bytes', 'sha256')}
+    else:
+        estado.pop('snapshot_input', None)
+
+
+def entradas_preparadas(carpeta, estado):
+    """Verifica todas las entradas antes del negocio y admite checkpoints anteriores de un solo input."""
+    registros = estado.get('inputs_descargados')
+    if registros is None:
+        registros = ([{'ruta': estado['entrada'], **estado['snapshot_input']}]
+                     if estado['entrada'] else [])
+    else:
+        esperadas = estado['trabajo'].get('inputs')
+        if esperadas is None:
+            esperadas = [estado['trabajo']['input']] if estado['trabajo']['input'] else []
+        if len(registros) != len(esperadas):
+            raise ErrorWeyland('No estan preparados todos los inputs de la solicitud')
+    rutas, total = [], 0
+    for registro in registros:
+        ruta = confinar(carpeta, registro['ruta'])
+        if (not ruta.is_relative_to(confinar(carpeta, RUTA_ENTRADA_BASE).parent)
+                or ruta.is_symlink() or not ruta.is_file()
+                or ruta.stat().st_size != registro['size_bytes'] or sha256(ruta) != registro['sha256']):
+            raise ErrorWeyland('Input alterado o no permitido')
+        total += registro['size_bytes']
+        if total > BACKEND_MAX_INPUTS_BYTES:
+            raise ErrorWeyland('Los inputs preparados superan el limite total')
+        rutas.append(ruta)
+    return rutas[0] if len(rutas) == 1 else tuple(rutas) if rutas else None
+
+
+#----------------------------------------------
+# FUNCIONES DE CONCILIACIÓN DE ENTREGAS
+#----------------------------------------------
+def conciliar(cliente, estado, carpeta):
     """Confirma el cierre remoto y la huella del reporte antes de resolver una entrega incierta."""
     detalle = cliente.consultar_ejecucion(estado['ejecucion_id'])
-    _comprobar_detalle(detalle, estado)
+    comprobar_detalle(detalle, estado)
     if estado.get('informar_estados') and detalle.get('estado_bot') in ('CANCELADO', 'INTERRUMPIDO'):
         final = detalle['estado_bot']
         esperado = 'CANCELADA' if final == 'CANCELADO' else 'ERROR'
@@ -408,16 +512,22 @@ def _conciliar(cliente, estado, carpeta):
         estado['estado_bot_publicado'] = detalle['estado_bot']
 
 
+#----------------------------------------------
+# FUNCIONES DE ORQUESTACIÓN DE LA COLA
+#----------------------------------------------
 def ejecutar_cola(cliente, maquina_id, trabajos, procesos, *, notificar=None):
     """Ejecuta el flujo y prepara el aviso de error ante fallos transitorios, conservando el checkpoint."""
     try:
-        return _procesar_solicitud_pendiente(cliente, maquina_id, trabajos, procesos, notificar=notificar)
-    except (ErrorRedWeyland, ErrorHTTPWeyland, OSError) as error:
-        temporal = not isinstance(error, ErrorHTTPWeyland) or error.status_code in (408, 429) or error.status_code >= 500
+        return procesar_solicitud_pendiente(cliente, maquina_id, trabajos, procesos, notificar=notificar)
+    except (ErrorWeyland, OSError) as error:
+        if isinstance(error, ErrorWeyland) and error.tipo not in ('RED', 'HTTP'):
+            raise
+        temporal = (not isinstance(error, ErrorWeyland) or error.tipo == 'RED'
+                    or error.status_code in (408, 429) or error.status_code >= 500)
         journal = Path(trabajos) / ARCHIVO_COORDINADOR
         if temporal and journal.is_file():
             with bloqueo(Path(trabajos) / ARCHIVO_BLOQUEO):
-                estado = _leer(journal)
+                estado = leer(journal)
                 if (estado.get('informar_estados') and estado.get('ejecucion_id')
                         and estado['fase'] not in FINALES | {'ENTREGA_INCIERTA', 'ERROR_INCIERTO'}):
                     estado.update(fase='ERROR_LISTO', estado_final_pendiente='ERROR',
@@ -426,7 +536,7 @@ def ejecutar_cola(cliente, maquina_id, trabajos, procesos, *, notificar=None):
         raise
 
 
-def _procesar_solicitud_pendiente(cliente, maquina_id, trabajos, procesos, *, notificar=None):
+def procesar_solicitud_pendiente(cliente, maquina_id, trabajos, procesos, *, notificar=None):
     """Una invocacion toma como maximo un trabajo; los POST nunca se repiten solos."""
     id_positivo(maquina_id)
     if not procesos or any(not isinstance(k, str) or not k.strip() or not isinstance(p, ProcesoBot)
@@ -438,18 +548,17 @@ def _procesar_solicitud_pendiente(cliente, maquina_id, trabajos, procesos, *, no
         raise ErrorWeyland('Directorio operativo no permitido')
     base = ruta_base.resolve()
     base.mkdir(parents=True, exist_ok=True)
-    cuenta = 'bot_api_key' if getattr(cliente.config, 'solo_api_key', False) else cliente.config.correo.casefold()
-    identidad = {'version': 1, 'contrato': 'cola_actual', 'backend': cliente.config.url,
-                 'cuenta_sha256': hashlib.sha256(cuenta.encode()).hexdigest(),
+    identidad = {'version': 1, 'contrato': 'cola_actual', 'backend': cliente.config['url'],
+                 'cuenta_sha256': cliente.config['cuenta_sha256'],
                  'maquina_id': maquina_id, 'codigos': sorted(procesos)}
     journal = base / ARCHIVO_COORDINADOR
-    with bloqueo(base / ARCHIVO_BLOQUEO), _contexto_de_error() as referencia:
-        estado = _leer(journal) if journal.exists() else None
+    with bloqueo(base / ARCHIVO_BLOQUEO), contexto_de_error() as referencia:
+        estado = leer(journal) if journal.exists() else None
         referencia['estado'] = estado
         if estado is not None:
-            _validar_estado(estado, identidad)
+            validar_checkpoint(estado, identidad)
             if estado['fase'] in ('COMPLETADA', 'ERROR', 'CANCELADO', 'INTERRUMPIDO'):
-                _avisar(notificar, 'resultados' if estado['fase'] == 'COMPLETADA' else 'fallas', estado,
+                avisar(notificar, 'resultados' if estado['fase'] == 'COMPLETADA' else 'fallas', estado,
                         confinar(base, CARPETA_EJECUCIONES + '/' + str(id_positivo(estado['ejecucion_id']))))
         if estado is None or estado['fase'] in FINALES:
             estado = {**identidad, 'id_externo': uuid4().hex, 'fase': 'TOMA_INCIERTA'}
@@ -458,8 +567,8 @@ def _procesar_solicitud_pendiente(cliente, maquina_id, trabajos, procesos, *, no
             # Guardado antes del POST. Una caída desde aquí exige conciliación.
             try:
                 datos = cliente.tomar_siguiente(maquina_id, estado['id_externo'])
-            except ErrorHTTPWeyland as error:
-                if error.status_code in (401, 403):
+            except ErrorWeyland as error:
+                if error.tipo == 'HTTP' and error.status_code in (401, 403):
                     # El backend rechaza autenticación/permisos antes del handler.
                     # Es una toma no aplicada, distinta de un timeout/5xx incierto.
                     estado.update(fase='TOMA_RECHAZADA', rechazo_http=error.status_code)
@@ -469,14 +578,15 @@ def _procesar_solicitud_pendiente(cliente, maquina_id, trabajos, procesos, *, no
                 estado['fase'] = 'SIN_TRABAJO'
                 guardar_json(journal, estado)
                 return estado
-            _asignar(cliente, datos, estado, procesos, base, journal)
+            asignar(cliente, datos, estado, procesos, base, journal)
         elif estado['fase'] == 'TOMA_INCIERTA':
-            _asignar(cliente, _recuperar_toma(cliente, estado), estado, procesos, base, journal)
+            asignar(cliente, recuperar_toma(cliente, estado), estado, procesos, base, journal)
         if estado['fase'] == 'ASIGNACION_INCOMPATIBLE':
-            raise ErrorWeyland('Asignacion incompatible pendiente de revision; no se tomara otro trabajo')
+            raise ErrorWeyland('Asignacion incompatible pendiente de revision; no se tomara otro trabajo',
+                               tipo='ASIGNACION_INCOMPATIBLE')
         carpeta = confinar(base, CARPETA_EJECUCIONES + '/' + str(id_positivo(estado['ejecucion_id'])))
         if estado['fase'] in ('ENTREGA_INCIERTA', 'ERROR_INCIERTO'):
-            _conciliar(cliente, estado, carpeta)
+            conciliar(cliente, estado, carpeta)
             guardar_json(journal, estado)
         if estado['fase'] == 'EJECUTANDO':
             if not estado.get('informar_estados'):
@@ -489,38 +599,30 @@ def _procesar_solicitud_pendiente(cliente, maquina_id, trabajos, procesos, *, no
             publicar_estado(cliente, estado, journal, 'PENDIENTE', 'Preparando el trabajo')
         if estado['fase'] in ('DESCARGANDO', 'PREPARADO'):
             try:
-                _avisar(notificar, 'inicio', estado, carpeta)
+                avisar(notificar, 'inicio', estado, carpeta)
             except Exception:
                 estado.update(fase='ERROR_LISTO', estado_final_pendiente='ERROR',
                     mensaje_error='No se pudo confirmar el correo inicial; no se inició el negocio.')
                 guardar_json(journal, estado)
         if estado['fase'] == 'DESCARGANDO':
             try:
-                entrada = estado['trabajo']['input']
-                if proceso.requiere_input is True and entrada is None or proceso.requiere_input is False and entrada is not None:
-                    raise ValueError('Modalidad de input no admitida')
-                if entrada is not None:
-                    extension = Path(entrada['nombre']).suffix.lower()
-                    if extension not in proceso.extensiones:
-                        raise ValueError('Extension de entrada no admitida')
-                    nombre = RUTA_ENTRADA_BASE + extension
-                    snapshot = cliente.descargar_input(estado['ejecucion_id'], confinar(carpeta, nombre))
-                    estado.update(entrada=nombre, snapshot_input=snapshot)
-                else:
-                    estado['entrada'] = None
+                preparar_entradas(cliente, estado, carpeta, journal, proceso)
                 estado['fase'] = 'PREPARADO'
             except KeyboardInterrupt:
                 if not estado.get('informar_estados'):
                     raise
                 estado.update(fase='ERROR_LISTO', estado_final_pendiente='CANCELADO',
                     mensaje_error='El operador cancelo la ejecucion durante la preparacion.')
-            except (ErrorRedWeyland, OSError):
+            except OSError:
                 raise
-            except ErrorHTTPWeyland as error:
-                if error.status_code in (408, 429) or error.status_code >= 500:
+            except ErrorWeyland as error:
+                if error.tipo == 'RED' or (error.tipo == 'HTTP' and (
+                        error.status_code in (408, 429) or error.status_code >= 500)):
                     raise
-                estado.update(fase='ERROR_LISTO', etapa_error='input', mensaje_error='No se pudo obtener un input valido para la ejecucion.')
-            except (ValueError, ErrorWeyland):
+                mensaje = ('No se pudo obtener un input valido para la ejecucion.' if error.tipo == 'HTTP'
+                           else 'La entrada de la ejecucion es incompatible o invalida.')
+                estado.update(fase='ERROR_LISTO', etapa_error='input', mensaje_error=mensaje)
+            except ValueError:
                 estado.update(fase='ERROR_LISTO', etapa_error='input', mensaje_error='La entrada de la ejecucion es incompatible o invalida.')
             guardar_json(journal, estado)
         if estado['fase'] == 'PREPARADO':
@@ -531,10 +633,7 @@ def _procesar_solicitud_pendiente(cliente, maquina_id, trabajos, procesos, *, no
             estado['fase'] = 'EJECUTANDO'
             guardar_json(journal, estado)
             try:
-                entrada = confinar(carpeta, estado['entrada']) if estado['entrada'] else None
-                if entrada is not None and (sha256(entrada) != estado['snapshot_input']['sha256']
-                        or entrada.stat().st_size != estado['snapshot_input']['size_bytes']):
-                    raise ErrorWeyland('Input alterado')
+                entrada = entradas_preparadas(carpeta, estado)
                 resultado = proceso.ejecutar(carpeta, entrada, estado['trabajo']['parametros'])
                 estado.update(resultado=snapshot_resultado(carpeta, resultado), fase='EXPORT_PENDIENTE')
             except KeyboardInterrupt:
@@ -590,10 +689,13 @@ def _procesar_solicitud_pendiente(cliente, maquina_id, trabajos, procesos, *, no
             raise ErrorWeyland('Fase inesperada; no se repetira el proceso')
         guardar_json(carpeta / ARCHIVO_FINALIZACION, {'fase': estado['fase'], 'ejecucion_id': estado['ejecucion_id'],
                                                    'id_externo': estado['id_externo']})
-        _avisar(notificar, 'resultados' if estado['fase'] == 'COMPLETADA' else 'fallas', estado, carpeta)
+        avisar(notificar, 'resultados' if estado['fase'] == 'COMPLETADA' else 'fallas', estado, carpeta)
         return estado
 
 
+#----------------------------------------------
+# FUNCIONES DE MIGRACIÓN Y ARRANQUE CONFIGURADO
+#----------------------------------------------
 def verificar_migracion(base):
     """No ocultar trabajos del contrato anterior al estrenar un namespace."""
     for ruta in base.rglob(ARCHIVO_ESTADO):
@@ -609,8 +711,8 @@ def verificar_migracion(base):
 
 def ejecutar_cola_configurada(fabrica, valores, raiz, procesos, *, notificar=None):
     """Valida contrato y rutas, autentica el cliente y coordina una solicitud con la configuración recibida."""
-    if valores.get('BACKEND_CONTRATO') != 'cola_actual' or valores.get('BACKEND_AUTH_MODE') not in ('weyland', 'api_key'):
-        raise ValueError('Configurar BACKEND_CONTRATO=cola_actual y BACKEND_AUTH_MODE=weyland o api_key')
+    if valores.get('BACKEND_CONTRATO') != 'cola_actual' or valores.get('BACKEND_AUTH_MODE') != 'weyland':
+        raise ValueError('Configurar BACKEND_CONTRATO=cola_actual y BACKEND_AUTH_MODE=weyland')
     if str(valores.get('BACKEND_REUTILIZAR_ULTIMA') or 'false').lower() != 'false':
         raise ValueError('No se reutilizan solicitudes anteriores')
     maquina = entero_configurado(valores, 'BACKEND_MAQUINA_ID')
@@ -623,8 +725,8 @@ def ejecutar_cola_configurada(fabrica, valores, raiz, procesos, *, notificar=Non
     with fabrica() as cliente:
         if not isinstance(cliente, ClienteColaWeyland):
             raise ErrorWeyland('La fabrica no corresponde al contrato cola_actual')
-        if not cliente.config.api_key and cliente.config.bot_auth_mode != 'jwt':
-            raise ErrorWeyland('Falta la API key del bot; no se tomara trabajo')
+        if cliente.config['bot_auth_mode'] != 'jwt':
+            raise ErrorWeyland('Se requiere autenticacion JWT antes de tomar trabajo')
         cliente.verificar()
         return ejecutar_cola(cliente, maquina, base / 'cola_actual' / ('maquina_' + str(maquina)),
                               procesos, notificar=notificar)

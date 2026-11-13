@@ -44,7 +44,8 @@ from config.configuracion import (
     registrar,
     slug,
 )
-from contextlib import closing
+from contextlib import closing, contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from io import BytesIO
 from openpyxl import (
@@ -177,6 +178,9 @@ input.on('close', () => socket.close());
 ARCHIVO_SESION_CHROME = 'sesion_chrome.json'
 
 
+#----------------------------------------------
+# CONTROL DEL NAVEGADOR CHROME
+#----------------------------------------------
 class ChromeRobot:
     def __init__(self, carpeta, puerto=None, timeout=RPA_TIMEOUT, headless=RPA_HEADLESS):
         """Inicializa el controlador de Chrome con las rutas y opciones del entorno."""
@@ -191,19 +195,19 @@ class ChromeRobot:
         self._secuencia = 0
         self._target_id = None
 
-    def _http(self, ruta, metodo='GET'):
+    def consultar_http(self, ruta, metodo='GET'):
         """Consulta un endpoint local de Chrome y devuelve su respuesta JSON."""
         with urlopen(Request(self.url_base + ruta, method=metodo), timeout=RPA_HTTP_TIMEOUT) as respuesta:
             return json.load(respuesta)
 
-    def _paginas(self):
+    def paginas(self):
         """Obtiene las pestañas disponibles o indica que Chrome todavía no responde."""
         try:
-            return self._http('/json/list')
+            return self.consultar_http('/json/list')
         except (URLError, OSError):
             return None
 
-    def _elegir_pagina(self, paginas):
+    def elegir_pagina(self, paginas):
         """Recupera la pestaña de la sesión anterior o selecciona una página disponible."""
         pagina_id = None
         archivo = self.carpeta / ARCHIVO_SESION_CHROME
@@ -215,7 +219,7 @@ class ChromeRobot:
         return next((p for p in paginas if p.get('type') == 'page' and p['id'] == pagina_id),
                     next((p for p in paginas if p.get('type') == 'page'), None))
 
-    def _lanzar(self):
+    def lanzar(self):
         """Localiza Chrome y lo inicia con el puerto de automatización y perfil del bot."""
         candidatos = [os.getenv('CHROME_PATH'),
                       r'C:\Program Files\Google\Chrome\Application\chrome.exe',
@@ -253,19 +257,19 @@ class ChromeRobot:
         version = subprocess.run([nodo, '--version'], capture_output=True, text=True, check=True).stdout
         if int(version.lstrip('v').split('.')[0]) < 22:
             raise RuntimeError('Se necesita Node.js 22 o posterior para conectar con Chrome')
-        paginas = self._paginas()
+        paginas = self.paginas()
         reutilizada = paginas is not None
         if not reutilizada:
-            self._lanzar()
+            self.lanzar()
             limite = time.monotonic() + self.timeout
             while paginas is None and time.monotonic() < limite:
                 time.sleep(RPA_SONDEO_INTERVALO)
-                paginas = self._paginas()
+                paginas = self.paginas()
             if paginas is None:
                 raise RuntimeError('Chrome no habilito su conexion de automatizacion')
-        pagina = self._elegir_pagina(paginas)
+        pagina = self.elegir_pagina(paginas)
         if pagina is None:
-            pagina = self._http('/json/new?' + quote('about:blank', safe=''), 'PUT')
+            pagina = self.consultar_http('/json/new?' + quote('about:blank', safe=''), 'PUT')
         self._target_id = pagina['id']
         argumentos = [nodo, '-e', PUENTE_CHROME_JS,
                       pagina['webSocketDebuggerUrl'], str(int(self.timeout * 1000))]
@@ -273,7 +277,7 @@ class ChromeRobot:
                                         stderr=subprocess.DEVNULL, text=True, encoding='utf-8', bufsize=1,
                                         creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
         try:
-            if not self._leer().get('ready'):
+            if not self.leer().get('ready'):
                 raise RuntimeError('Chrome no confirmo la conexion')
             self.maximizar()
             self.carpeta.mkdir(parents=True, exist_ok=True)
@@ -283,7 +287,7 @@ class ChromeRobot:
             raise
         return reutilizada
 
-    def _leer(self):
+    def leer(self):
         """Lee una respuesta del puente CDP y detecta desconexiones o errores."""
         linea = self._puente.stdout.readline()
         if not linea:
@@ -300,7 +304,7 @@ class ChromeRobot:
         self._secuencia += 1
         self._puente.stdin.write(json.dumps({'id': self._secuencia, 'method': metodo, 'params': parametros or {}}) + '\n')
         self._puente.stdin.flush()
-        respuesta = self._leer()
+        respuesta = self.leer()
         if respuesta.get('error'):
             raise RuntimeError('Chrome: ' + respuesta['error'].get('message', str(respuesta['error'])))
         return respuesta.get('result', {})
@@ -322,7 +326,7 @@ class ChromeRobot:
         return resultado.get('result', {}).get('value', '')
 
     @staticmethod
-    def _elemento(selector):
+    def elemento(selector):
         """Construye una expresión de búsqueda de un elemento por CSS o XPath."""
         valor = json.dumps(selector)
         if selector.startswith(('/', '(')):
@@ -331,18 +335,18 @@ class ChromeRobot:
 
     def present(self, selector):
         """Indica si el selector corresponde a un elemento presente en la página."""
-        return bool(self.dom('return !!(' + self._elemento(selector) + ');'))
+        return bool(self.dom('return !!(' + self.elemento(selector) + ');'))
 
     def click(self, selector):
         """Enfoca y pulsa el elemento seleccionado cuando existe."""
-        return bool(self.dom('var e=' + self._elemento(selector) + '; if(!e)return false; e.focus(); e.click(); return true;'))
+        return bool(self.dom('var e=' + self.elemento(selector) + '; if(!e)return false; e.focus(); e.click(); return true;'))
 
     def type(self, selector, texto):
         """Introduce texto en el elemento y permite reemplazar su contenido."""
         limpiar = texto.startswith('[clear]')
         if limpiar:
             texto = texto[len('[clear]'):]
-        if not self.dom('var e=' + self._elemento(selector) + '; if(!e)return false; e.focus();' +
+        if not self.dom('var e=' + self.elemento(selector) + '; if(!e)return false; e.focus();' +
                         ('e.select();' if limpiar else '') + 'return true;'):
             return False
         self.llamar('Input.insertText', {'text': texto})
@@ -390,14 +394,67 @@ class ChromeRobot:
         return True
 
 
-r = ChromeRobot(RUTA_TEMPORALES, timeout=RPA_TIMEOUT, headless=RPA_HEADLESS)
+# Clave estable; no se construye un navegador ni se comparten capturas al importar.
+SESION_AUTOMATIZACION = ContextVar('sesion_automatizacion', default=None)
 
 
+#----------------------------------------------
+# SESIÓN DE AUTOMATIZACIÓN POR EJECUCIÓN
+#----------------------------------------------
+class SesionAutomatizacion:
+    def __init__(self, navegador=None):
+        """Agrupa el controlador y las evidencias exclusivas de una automatización."""
+        self._navegador = navegador
+        self.capturas = []
+
+    @property
+    def navegador(self):
+        """Crea Chrome de forma diferida y conserva el mismo controlador dentro de la sesión."""
+        if self._navegador is None:
+            self._navegador = ChromeRobot(RUTA_TEMPORALES, timeout=RPA_TIMEOUT, headless=RPA_HEADLESS)
+        return self._navegador
+
+    def cerrar(self):
+        """Desconecta el controlador si existe, sin cerrar la ventana reutilizable de Chrome."""
+        navegador, self._navegador = self._navegador, None
+        if navegador is not None:
+            try:
+                navegador.close()
+            except Exception:
+                pass
+
+
+def obtener_sesion():
+    """Obtiene la sesión del contexto o crea una para el uso directo de las funciones."""
+    sesion = SESION_AUTOMATIZACION.get()
+    if sesion is None:
+        sesion = SesionAutomatizacion()
+        SESION_AUTOMATIZACION.set(sesion)
+    return sesion
+
+
+@contextmanager
+def sesion_automatizacion(sesion=None):
+    """Delimita navegador y evidencias, cierra recursos y restaura el contexto anterior."""
+    actual = sesion if sesion is not None else SesionAutomatizacion()
+    token = SESION_AUTOMATIZACION.set(actual)
+    try:
+        yield actual
+    finally:
+        try:
+            actual.cerrar()
+        finally:
+            SESION_AUTOMATIZACION.reset(token)
+
+
+#----------------------------------------------
+# FUNCIONES DE JAVASCRIPT Y APERTURA DEL NAVEGADOR
+#----------------------------------------------
 def evaluar_js(cuerpo, reintentos=RPA_JS_REINTENTOS, pausa=RPA_JS_PAUSA):
     """Evalúa JavaScript con intentos y pausas limitados por la configuración."""
     for intento in range(reintentos):
         try:
-            salida = r.dom(cuerpo)
+            salida = obtener_sesion().navegador.dom(cuerpo)
             if salida is not None and str(salida).strip() != "":
                 return str(salida).strip()
         except Exception as error:
@@ -408,18 +465,21 @@ def evaluar_js(cuerpo, reintentos=RPA_JS_REINTENTOS, pausa=RPA_JS_PAUSA):
 
 def abrir_navegador():
     """Abre o reutiliza Chrome y registra el modo de conexión."""
-    reutilizada = r.abrir()
+    reutilizada = obtener_sesion().navegador.abrir()
     registrar("Chrome: " + ("sesion reutilizada" if reutilizada else "sesion nueva")
               + ("; modo sin interfaz" if RPA_HEADLESS else "; ventana maximizada"), "NAVEGADOR")
 
 
+#----------------------------------------------
+# FUNCIONES DE CAPTURA DE ERRORES
+#----------------------------------------------
 def captura_error(nombre_archivo):
     """Guarda una captura de evidencia y registra cualquier fallo de captura."""
     try:
         Path(CARPETA_CAPTURAS).mkdir(parents=True, exist_ok=True)
         destino = Path(CARPETA_CAPTURAS) / (nombre_archivo + ".png")
         time.sleep(RPA_CAPTURA_PAUSA)
-        r.snap("page",str(destino))
+        obtener_sesion().navegador.snap("page",str(destino))
         return str(destino)
     except Exception as error:
         registrar("No se pudo guardar la captura: " + str(error))
@@ -427,6 +487,9 @@ def captura_error(nombre_archivo):
 
 
 # Validación, lectura de entradas y catálogo.
+#----------------------------------------------
+# FUNCIONES DE CONFIGURACIÓN DEL CATÁLOGO
+#----------------------------------------------
 def resolver_catalogo(catalogo):
     """Completa URLs y esperas del catálogo con las variables de entorno."""
     if not isinstance(catalogo, dict):
@@ -452,6 +515,9 @@ def resolver_catalogo(catalogo):
     return catalogo
 
 
+#----------------------------------------------
+# FUNCIONES DE MARCAS, PRECIOS Y FILTROS
+#----------------------------------------------
 def normalizar_marca(valor):
     """Normaliza acentos y espacios para comparar marcas sin diferencias de formato."""
     texto = unicodedata.normalize("NFKD", str(valor or "").casefold())
@@ -502,9 +568,19 @@ MOTIVOS_DESCARTE = {
 }
 
 
+#----------------------------------------------
+# FUNCIONES DE CLASIFICACIÓN DE OBSERVACIONES Y ERRORES
+#----------------------------------------------
 def es_observacion_busqueda(error):
     """Solo descartes funcionales demostrados; fallos de carga/comunicacion son tecnicos."""
     texto = str(error or '')
+    if texto.startswith('Busqueda sin coincidencias confirmada: '):
+        try:
+            evidencia = json.loads(texto.split(': ', 1)[1])
+        except (ValueError, TypeError):
+            return False
+        return (isinstance(evidencia, dict) and evidencia.get('sin_resultados') is True
+                and type(evidencia.get('tarjetas')) is int and evidencia['tarjetas'] == 0)
     prefijo = 'Productos descartados por filtros o precio: '
     if texto.startswith(prefijo):
         try:
@@ -525,6 +601,8 @@ def describir_error_busqueda(error, estado='error'):
     if estado == 'leido':
         return 'La consulta terminó sin productos guardados; requiere revisión.'
     texto = str(error or '')
+    if texto.startswith('Busqueda sin coincidencias confirmada: ') and es_observacion_busqueda(texto):
+        return 'Producto no encontrado: el supermercado confirmó que no hay coincidencias para la búsqueda.'
     prefijo = 'Productos descartados por filtros o precio: '
     if texto.startswith(prefijo):
         try:
@@ -572,6 +650,9 @@ MAX_FILAS = obtener_entero_positivo('MAX_FILAS')
 MAX_COLUMNAS = obtener_entero_positivo('MAX_COLUMNAS')
 
 
+#----------------------------------------------
+# FUNCIONES DE SEGURIDAD DEL EXCEL
+#----------------------------------------------
 def validar_contenedor(ruta):
     """Devuelve una copia validada: el lector debe consumir estos mismos bytes."""
     ruta = Path(ruta)
@@ -587,14 +668,14 @@ def validar_contenedor(ruta):
         raise ValueError('Firma de bytes invalida: se requiere un Excel OOXML, no XLS ni otro formato')
     copia = BytesIO(contenido)
     try:
-        _validar_zip(copia)
+        validar_zip(copia)
     except (BadZipFile, expat.ExpatError, ErrorCompresion, EOFError, RuntimeError, NotImplementedError) as error:
         raise ValueError('El Excel esta corrupto, cifrado o contiene XML invalido') from error
     copia.seek(0)
     return copia
 
 
-def _validar_zip(copia):
+def validar_zip(copia):
     """Revisa expansión, entradas y contenido activo del contenedor Excel."""
     with ZipFile(copia) as archivo:
         entradas = archivo.infolist()
@@ -623,7 +704,7 @@ def _validar_zip(copia):
             raise ValueError('Faltan componentes obligatorios del Excel OOXML')
         total = 0
         for entrada in entradas:
-            parser = _parser_xml_seguro() if entrada.filename.casefold().endswith(('.xml', '.rels')) else None
+            parser = parser_xml_seguro() if entrada.filename.casefold().endswith(('.xml', '.rels')) else None
             with archivo.open(entrada) as origen:
                 while True:
                     bloque = origen.read(min(65536, MAX_EXPANDIDO - total + 1))
@@ -638,7 +719,7 @@ def _validar_zip(copia):
                 parser.Parse(b'', True)
 
 
-def _parser_xml_seguro():
+def parser_xml_seguro():
     """Crea un lector XML que rechaza fórmulas, entidades y construcciones inseguras."""
     parser = expat.ParserCreate(namespace_separator='}')
 
@@ -665,6 +746,9 @@ def _parser_xml_seguro():
     return parser
 
 
+#----------------------------------------------
+# FUNCIONES DE VALIDACIÓN Y ESCRITURA DE TEXTOS
+#----------------------------------------------
 def texto_entrada(valor, campo, fila, limite, obligatorio=False):
     """Valida y normaliza un texto del input, su obligatoriedad y longitud."""
     original = '' if valor is None else str(valor)
@@ -685,6 +769,9 @@ def agregar_fila_literal(hoja, valores):
             celda.data_type = 's'
 
 
+#----------------------------------------------
+# FUNCIONES DE LECTURA DE ENTRADAS JSON Y EXCEL
+#----------------------------------------------
 def leer_productos_json(ruta):
     """Productos de parametros web; no requiere ni crea un Excel."""
     if Path(ruta).stat().st_size > MAX_ARCHIVO:
@@ -822,12 +909,15 @@ def crear_plantilla_si_no_existe():
     print("Creado " + EXCEL_ENTRADA + " con 4 ejemplos")
 
 
+#----------------------------------------------
+# FUNCIONES DE SELECCIÓN DE SUPERMERCADOS
+#----------------------------------------------
 def cargar_supermercados():
     """Devuelve una copia del catálogo integrado con las URLs y esperas del entorno."""
     return resolver_catalogo(deepcopy(CATALOGO_SUPERMERCADOS))
 
 
-def _normalizar_nombre(valor):
+def normalizar_nombre(valor):
     """Normaliza un nombre de supermercado para resolver su clave de catálogo."""
     texto = unicodedata.normalize("NFKD", str(valor).strip().casefold())
     return "".join(caracter for caracter in texto if not unicodedata.combining(caracter))
@@ -835,18 +925,21 @@ def _normalizar_nombre(valor):
 
 def seleccionar_supermercados(valor, supermercados):
     """Devuelve claves habilitadas; un nombre incorrecto nunca significa todos."""
-    nombre = _normalizar_nombre(valor) if valor is not None else ""
+    nombre = normalizar_nombre(valor) if valor is not None else ""
     if not nombre:
         return [clave for clave, datos in supermercados.items() if datos.get("habilitado", True)]
 
     for clave, datos in supermercados.items():
-        if nombre in (_normalizar_nombre(clave), _normalizar_nombre(datos.get("nombre", clave))):
+        if nombre in (normalizar_nombre(clave), normalizar_nombre(datos.get("nombre", clave))):
             if not datos.get("habilitado", True):
                 raise ValueError("Supermercado deshabilitado: " + str(valor).strip())
             return [clave]
     raise ValueError("Supermercado desconocido: " + str(valor).strip())
 
 
+#----------------------------------------------
+# FUNCIONES DE CARGA DE ARCHIVOS Y TAREAS
+#----------------------------------------------
 def listar_archivos_entrada(carpeta=None):
     """Lista todos los Excel compatibles de la carpeta y omite archivos de bloqueo."""
     carpeta = Path(RUTA_INPUT if carpeta is None else carpeta)
@@ -856,21 +949,19 @@ def listar_archivos_entrada(carpeta=None):
 
 
 def cargar_excel_a_tabla_cola(ruta=None):
-    """Sin ruta, carga todos los Excel validos de la carpeta input."""
-    if ruta is not None:
-        return _cargar_archivo_a_cola(Path(ruta))
+    """Carga un Excel concreto o todos los de input y devuelve sus contadores de lectura."""
     logger = obtener_logger("DETAILS")
     carpeta = Path(RUTA_INPUT)
     resumen = {"archivos_leidos": 0, "archivos_error": 0, "tareas_agregadas": 0, "tareas_existentes": 0}
-    if not carpeta.is_dir():
+    if ruta is None and not carpeta.is_dir():
         logger.warning("No existe la carpeta de entrada: " + str(carpeta))
         return resumen
-    archivos = listar_archivos_entrada(carpeta)
+    archivos = [Path(ruta)] if ruta is not None else listar_archivos_entrada(carpeta)
     if not archivos:
         logger.info("No hay archivos Excel para cargar en " + str(carpeta))
     for archivo in archivos:
         try:
-            carga = _cargar_archivo_a_cola(archivo)
+            carga = cargar_archivo_a_cola(archivo)
         except Exception as error:
             resumen["archivos_error"] += 1
             logger.warning("Archivo omitido: " + archivo.name + "; " + str(error))
@@ -884,11 +975,11 @@ def cargar_excel_a_tabla_cola(ruta=None):
 
 def cargar_productos_json_a_tabla_cola(ruta):
     """Carga las tareas de una entrada JSON validada en la cola SQLite."""
-    carga = _cargar_archivo_a_cola(Path(ruta), lector=leer_productos_json)
+    carga = cargar_archivo_a_cola(Path(ruta), lector=leer_productos_json)
     return dict(carga, archivos_leidos=1, archivos_error=0)
 
 
-def _cargar_archivo_a_cola(ruta, lector=None):
+def cargar_archivo_a_cola(ruta, lector=None):
     """Registra el archivo, valida sus tareas y evita insertar tareas duplicadas."""
     logger = obtener_logger("DETAILS")
     archivo_id = registrar_archivo(ruta, ahora())
@@ -915,6 +1006,9 @@ def _cargar_archivo_a_cola(ruta, lector=None):
     return {"tareas_agregadas": agregadas, "tareas_existentes": omitidas}
 
 
+#----------------------------------------------
+# FUNCIONES DE DIAGNÓSTICO Y VALIDACIÓN DE ENTRADAS
+#----------------------------------------------
 def ver_datos_en_tabla_cola():
     """Muestra el resumen y los errores registrados en la cola local."""
     filas, errores = consultar_estado_cola()
@@ -1096,22 +1190,25 @@ COMPROBAR_UBICACION_JS = r"""
 """
 
 
-_capturas = []
-
-
-def _capturar(nombre_archivo):
+#----------------------------------------------
+# FUNCIONES DE EVIDENCIAS DEL PROCESO
+#----------------------------------------------
+def capturar(nombre_archivo):
     """Registra la captura de una consulta fallida como evidencia del proceso."""
     ruta = captura_error(nombre_archivo)
     if ruta:
-        _capturas.append(ruta)
+        obtener_sesion().capturas.append(ruta)
     return ruta
 
 
 def obtener_capturas():
     """Devuelve las capturas acumuladas en el procesamiento actual."""
-    return list(_capturas)
+    return list(obtener_sesion().capturas)
 
 
+#----------------------------------------------
+# FUNCIONES DE NORMALIZACIÓN DE PRECIOS
+#----------------------------------------------
 def limpiar_precio(texto):
     """Convierte el precio publicado por la tienda a un valor numérico comparable."""
     if not texto:
@@ -1179,6 +1276,9 @@ EXTRACTOR_JS = """
 """
 
 
+#----------------------------------------------
+# FUNCIONES DE EXTRACCIÓN DE PRODUCTOS
+#----------------------------------------------
 def obtener_selectores(datos_supermercado):
     """Combina los selectores y la estrategia de extracción de la tienda."""
     configuracion = datos_supermercado.get("extractor")
@@ -1219,8 +1319,12 @@ def inspeccionar_busqueda(datos_supermercado):
         }
         var campo = selectorBusqueda ? document.evaluate(selectorBusqueda, document, null,
             XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue : null;
+        var textoPagina = document.body ? document.body.innerText : '';
+        var avisoVacio = textoPagina.match(/no se encontraron resultados|no encontramos (?:resultados|productos|coincidencias)|no hay resultados/i);
         return JSON.stringify({url: location.href, titulo: document.title, busqueda_en_campo: campo ? campo.value : null,
-            tarjetas: cards.length, tarjetas_con_marca: marcas, muestras: muestras});
+            tarjetas: cards.length, tarjetas_con_marca: marcas, muestras: muestras,
+            sin_resultados: cards.length === 0 && !!avisoVacio,
+            mensaje_sin_resultados: avisoVacio ? avisoVacio[0] : null});
     """
     salida = evaluar_js(" ".join(cuerpo.split()), reintentos=1)
     try:
@@ -1278,7 +1382,7 @@ def esperar_productos(datos_supermercado, max_items=MAX_PRODUCTOS_POR_BUSQUEDA, 
                         break
         if len(resultados) >= max_items:
             break
-        r.dom("return window.scrollTo(0, document.body.scrollHeight)")
+        obtener_sesion().navegador.dom("return window.scrollTo(0, document.body.scrollHeight)")
         time.sleep(RPA_RESULTADOS_INTERVALO)
     registrar("Lectura de productos: aceptados=" + str(len(resultados)) + "; descartados="
               + json.dumps(descartados, ensure_ascii=False), "SCRAPING")
@@ -1292,13 +1396,18 @@ def esperar_productos(datos_supermercado, max_items=MAX_PRODUCTOS_POR_BUSQUEDA, 
             raise ValueError(estado["error"])
         if estado.get("tarjetas", 0):
             raise ValueError("Hay tarjetas pero el extractor no reconoce nombre, enlace o precio publico: " + json.dumps(estado, ensure_ascii=False))
+        if estado.get('sin_resultados') is True and estado.get('tarjetas') == 0:
+            raise ValueError('Busqueda sin coincidencias confirmada: ' + json.dumps(estado, ensure_ascii=False))
         raise ValueError("Busqueda sin tarjetas de productos; comprobar envio, carga o selector de tarjeta: " + json.dumps(estado, ensure_ascii=False))
     return resultados
 
 
+#----------------------------------------------
+# FUNCIONES DE NAVEGACIÓN Y BÚSQUEDA
+#----------------------------------------------
 def enviar_enter(selector):
     """Envia una pulsacion Enter al navegador conectado."""
-    if not r.click(selector):
+    if not obtener_sesion().navegador.click(selector):
         raise RuntimeError("No se pudo enfocar el buscador antes de presionar Enter")
     for tipo in ("keyDown", "keyUp"):
         evento = {
@@ -1311,7 +1420,7 @@ def enviar_enter(selector):
         if tipo == "keyDown":
             evento.update(text="\r", unmodifiedText="\r")
         instruccion = "js chrome_step('Input.dispatchKeyEvent', " + json.dumps(evento) + ");"
-        if not r.send(instruccion):
+        if not obtener_sesion().navegador.send(instruccion):
             raise RuntimeError("No se pudo presionar Enter en el buscador")
 
 
@@ -1321,16 +1430,16 @@ def navegar_busqueda(datos_supermercado, termino):
     selector = datos_supermercado.get("selector_busqueda")
     if not selector:
         url = datos_supermercado["url_busqueda"].replace("{termino}", quote(termino, safe=""))
-        r.url(url)
+        obtener_sesion().navegador.url(url)
         time.sleep(espera)
         return url
 
     url = datos_supermercado["url_inicio"]
-    if not r.url(url):
+    if not obtener_sesion().navegador.url(url):
         raise RuntimeError("No se pudo abrir la pagina de " + datos_supermercado["nombre"])
     time.sleep(espera)
     fin = time.monotonic() + RPA_ESPERA_MAX
-    while not r.present(selector):
+    while not obtener_sesion().navegador.present(selector):
         salida = evaluar_js(COMPROBAR_ACCESO_JS + "return JSON.stringify({});", reintentos=1)
         try:
             estado = json.loads(salida)
@@ -1342,12 +1451,12 @@ def navegar_busqueda(datos_supermercado, termino):
             raise TimeoutError("No se encontro el campo de busqueda: " + selector)
         time.sleep(RPA_ESCRITURA_PAUSA)
 
-    if not r.type(selector, "[clear]" + termino):
+    if not obtener_sesion().navegador.type(selector, "[clear]" + termino):
         raise RuntimeError("No se pudo escribir o enviar la busqueda en " + datos_supermercado["nombre"])
     time.sleep(RPA_ESCRITURA_PAUSA)
     boton = datos_supermercado.get("selector_enviar_busqueda")
     if boton:
-        if not r.click(boton):
+        if not obtener_sesion().navegador.click(boton):
             raise RuntimeError("No se pudo enviar la busqueda en " + datos_supermercado["nombre"])
     else:
         enviar_enter(selector)
@@ -1387,6 +1496,9 @@ def buscar_producto(datos_supermercado, termino, max_items=MAX_PRODUCTOS_POR_BUS
     return productos
 
 
+#----------------------------------------------
+# FUNCIONES DE PROCESAMIENTO Y REINTENTOS
+#----------------------------------------------
 def procesar_tarea(datos_supermercado, termino, id_tarea, clave_super, producto, max_items=MAX_PRODUCTOS_POR_BUSQUEDA,
                    marca=None, precio_minimo=None, precio_maximo=None, *, ejecutar_con_reintentos):
     """Ejecuta los reintentos de una consulta y guarda su éxito o su fallo final."""
@@ -1403,7 +1515,7 @@ def procesar_tarea(datos_supermercado, termino, id_tarea, clave_super, producto,
     def registrar_fallo(error, numero, final):
         """Actualiza la tarea y captura evidencia si se agotaron los intentos."""
         if final:
-            _capturar(slug(clave_super) + "_" + slug(producto))
+            capturar(slug(clave_super) + "_" + slug(producto))
             actualizar_cola(id_tarea, "error", numero, ahora(), error=str(error))
         else:
             actualizar_cola(id_tarea, "pendiente", numero)
@@ -1418,7 +1530,7 @@ def procesar_tarea(datos_supermercado, termino, id_tarea, clave_super, producto,
 def procesar_cola_a_resultados(ejecutar_con_reintentos):
     """Procesa las tareas pendientes y desconecta el navegador al finalizar."""
     logger = obtener_logger("SCRAPING")
-    _capturas.clear()
+    obtener_sesion().capturas.clear()
     reencolados = reencolar_errores()
     if reencolados:
         logger.info("Reencoladas " + str(reencolados) + "tareas con error a reintentar")
@@ -1437,7 +1549,7 @@ def procesar_cola_a_resultados(ejecutar_con_reintentos):
         for (id_tarea, clave_super, producto, marca, minimo, maximo) in pendientes:
             datos_supermercado = supermercados.get(clave_super)
             if not datos_supermercado or not datos_supermercado.get("habilitado", True):
-                _capturar(slug(clave_super) + "_" + slug(producto))
+                capturar(slug(clave_super) + "_" + slug(producto))
                 actualizar_cola(id_tarea, "error", 0, ahora(),
                                 error="supermercado desconocido o deshabilitado")
                 errores += 1
@@ -1452,7 +1564,7 @@ def procesar_cola_a_resultados(ejecutar_con_reintentos):
                 errores += 1
     finally:
         try:
-            r.close()
+            obtener_sesion().cerrar()
         except Exception:
             pass
 
@@ -1461,30 +1573,34 @@ def procesar_cola_a_resultados(ejecutar_con_reintentos):
     return {"ok": ok, "errores": errores, "fallos": fallos, "capturas": obtener_capturas()}
 
 
+#----------------------------------------------
+# FUNCIONES DE DIAGNÓSTICO DEL NAVEGADOR
+#----------------------------------------------
 def diagnosticar(clave, termino="leche", marca=None, precio_minimo=None, precio_maximo=None):
     """Ejecuta una búsqueda de diagnóstico y muestra su resultado e inspección del DOM."""
-    supermercados = cargar_supermercados()
-    datos = supermercados.get(clave)
-    if not datos:
-        print("Supermercado desconocido: " + clave)
-        print("Opciones: " + ", ".join(supermercados.keys()))
-        return
+    with sesion_automatizacion():
+        supermercados = cargar_supermercados()
+        datos = supermercados.get(clave)
+        if not datos:
+            print("Supermercado desconocido: " + clave)
+            print("Opciones: " + ", ".join(supermercados.keys()))
+            return
 
-    print("Diagnosticando '" + clave + "' con el término '" + termino + "'")
+        print("Diagnosticando '" + clave + "' con el término '" + termino + "'")
 
-    try:
-        abrir_navegador()
         try:
-            productos = buscar_producto(datos, termino, marca=marca,
-                                        precio_minimo=precio_minimo, precio_maximo=precio_maximo)
-            resumen = {"estado": "ok", "productos": productos}
-        except Exception as error:
-            resumen = {"estado": "error", "error": str(error)}
-        resumen["dom"] = inspeccionar_busqueda(datos)
-        print(json.dumps(resumen, ensure_ascii=False, indent=2))
-        return resumen
-    finally:
-        try:
-            r.close()
-        except Exception:
-            pass
+            abrir_navegador()
+            try:
+                productos = buscar_producto(datos, termino, marca=marca,
+                                            precio_minimo=precio_minimo, precio_maximo=precio_maximo)
+                resumen = {"estado": "ok", "productos": productos}
+            except Exception as error:
+                resumen = {"estado": "error", "error": str(error)}
+            resumen["dom"] = inspeccionar_busqueda(datos)
+            print(json.dumps(resumen, ensure_ascii=False, indent=2))
+            return resumen
+        finally:
+            try:
+                obtener_sesion().cerrar()
+            except Exception:
+                pass

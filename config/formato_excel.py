@@ -13,6 +13,9 @@ FUENTE_ENCABEZADO = Font(bold=True, color="FFFFFF")
 ALINEACION_ENCABEZADO = Alignment(horizontal="center", vertical="center")
 
 
+#----------------------------------------------
+# FUNCIONES DE FORMATO DE EXCEL
+#----------------------------------------------
 def aplicar_formato_salida_excel(hoja, congelar=True, autofiltro=True, ancho_max=45):
     "formato de excel para generar los resultados"
     if hoja.max_row < 1:

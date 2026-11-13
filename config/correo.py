@@ -26,6 +26,9 @@ from email.utils import formatdate, parseaddr
 from pathlib import Path
 
 
+#----------------------------------------------
+# ERRORES DE ENTREGA DE CORREOS
+#----------------------------------------------
 class ErrorEntrega(RuntimeError):
     def __init__(self, codigo, *, incierto=False, permanente=False):
         """Clasifica un fallo SMTP como permanente o incierto sin conservar datos sensibles."""
@@ -33,6 +36,9 @@ class ErrorEntrega(RuntimeError):
         super().__init__(codigo)
 
 
+#----------------------------------------------
+# COLA PERSISTENTE DE CORREOS
+#----------------------------------------------
 class ColaCorreo:
     def __init__(self, carpeta, max_intentos=5, espera=60):
         """Prepara la base de notificaciones y valida los límites de recuperación por destinatario."""
@@ -67,6 +73,9 @@ class ColaCorreo:
         finally:
             con.close()
 
+    #----------------------------------------------
+    # FUNCIONES DE REGISTRO Y ENTREGA
+    #----------------------------------------------
     def registrar(self, identificador, remitente, destinatarios, mime, datos_contexto):
         """Conserva un mensaje y sus destinatarios sin duplicar su identificador de envío."""
         if not 0 < len(mime) <= 30 * 1024 * 1024:
@@ -136,6 +145,9 @@ class ColaCorreo:
                          for correo, (estado, proximo, codigo) in estados.items()])
         return self.resumen(solo=solo)
 
+    #----------------------------------------------
+    # FUNCIONES DE CONSULTA Y RECUPERACIÓN
+    #----------------------------------------------
     def resumen(self, *, solo=None):
         """Cuenta los destinatarios por estado, opcionalmente para un mensaje concreto."""
         with self.conexion() as con:
@@ -171,7 +183,10 @@ class ColaCorreo:
 MAX_ADJUNTOS_BYTES = configuracion.obtener_entero_positivo('MAX_ADJUNTOS_BYTES')
 
 
-def _destinatarios(valor):
+#----------------------------------------------
+# FUNCIONES DE DESTINATARIOS Y ADJUNTOS
+#----------------------------------------------
+def normalizar_destinatarios(valor):
     """Separa direcciones y elimina duplicados sin distinguir mayúsculas."""
     salida, vistos = [], set()
     for correo in re.split(r"[,;\s]+", valor or ""):
@@ -184,13 +199,13 @@ def _destinatarios(valor):
 def destinatarios_evento(evento):
     """Selecciona las listas de distribución de inicio, resultados o fallas."""
     if evento == 'error':
-        return _destinatarios(configuracion.LISTA_DISTRIBUCION_ERROR)
+        return normalizar_destinatarios(configuracion.LISTA_DISTRIBUCION_ERROR)
     if evento in ('inicio', 'resultados'):
-        return _destinatarios(configuracion.LISTA_DISTRIBUCION_ERROR + ',' + configuracion.LISTA_DISTRIBUCION_CORREO)
+        return normalizar_destinatarios(configuracion.LISTA_DISTRIBUCION_ERROR + ',' + configuracion.LISTA_DISTRIBUCION_CORREO)
     raise ValueError('Evento de correo desconocido: ' + str(evento))
 
 
-def _adjuntar(mensaje, rutas):
+def adjuntar(mensaje, rutas):
     """Valida los adjuntos y su tamaño total antes de incorporarlos al mensaje."""
     total = 0
     for ruta in rutas or []:
@@ -208,6 +223,9 @@ def _adjuntar(mensaje, rutas):
         mensaje.attach(adjunto)
 
 
+#----------------------------------------------
+# FUNCIONES DE CONSTRUCCIÓN Y ENVÍO DE CORREOS
+#----------------------------------------------
 def enviar_email(titulo, texto, destinatarios=None, adjuntos=None):
     """Valida y encola el mensaje dentro de su contexto y procesa su entrega sin duplicarlo."""
     if not configuracion.MODULO_CORREO:
@@ -217,7 +235,7 @@ def enviar_email(titulo, texto, destinatarios=None, adjuntos=None):
         remitente = obtener_variable_opcional("email_remitente", "")
         if destinatarios is None:
             destinatarios = destinatarios_evento("resultados")
-        destinatarios = _destinatarios(','.join(destinatarios) if not isinstance(destinatarios, str) else destinatarios)
+        destinatarios = normalizar_destinatarios(','.join(destinatarios) if not isinstance(destinatarios, str) else destinatarios)
         destinatarios = [correo.casefold() for correo in destinatarios]
         if (not remitente or not destinatarios or len(destinatarios) > 200
                 or any('\r' in valor or '\n' in valor for valor in (titulo, remitente))
@@ -231,7 +249,7 @@ def enviar_email(titulo, texto, destinatarios=None, adjuntos=None):
         mensaje["From"] = remitente
         mensaje["To"] = ", ".join(destinatarios)
         mensaje.attach(MIMEText(texto, "plain", "utf-8"))
-        _adjuntar(mensaje, adjuntos)
+        adjuntar(mensaje, adjuntos)
         componentes = {'titulo': titulo, 'texto': texto, 'remitente': remitente,
             'destinatarios': sorted(destinatarios), 'contexto': datos_contexto,
             'adjuntos': [(parte.get_filename(), hashlib.sha256(parte.get_payload(decode=True)).hexdigest())
@@ -244,7 +262,7 @@ def enviar_email(titulo, texto, destinatarios=None, adjuntos=None):
             mensaje['X-Weyland-Solicitud'] = str(datos_contexto['solicitud_id'])
         cola = obtener_cola()
         cola.registrar(identificador, remitente, destinatarios, mensaje.as_bytes(), datos_contexto)
-        cola.procesar(_enviar_preparado, solo=identificador)
+        cola.procesar(enviar_preparado, solo=identificador)
         aceptado = cola.entregado(identificador)
         if aceptado:
             logger.info('Correo %s: ACEPTADO_SMTP', identificador)
@@ -255,6 +273,9 @@ def enviar_email(titulo, texto, destinatarios=None, adjuntos=None):
         return aceptado
 
 
+#----------------------------------------------
+# FUNCIONES DE CONFIGURACIÓN DE LA COLA
+#----------------------------------------------
 def obtener_cola():
     """Construye la cola de notificaciones con la ruta y los reintentos configurados."""
     return ColaCorreo(ruta_cola(), configuracion.obtener_entero_positivo('CORREO_MAX_INTENTOS', 5),
@@ -266,7 +287,10 @@ def ruta_cola():
     return Path(obtener_variable_opcional('CORREO_PENDIENTES_DIR') or configuracion.RUTA_TEMPORALES / 'correos')
 
 
-def _enviar_preparado(remitente, destinatarios, mime):
+#----------------------------------------------
+# FUNCIONES DE TRANSPORTE SMTP
+#----------------------------------------------
+def enviar_preparado(remitente, destinatarios, mime):
     """Envía el MIME por SMTP con TLS y traduce fallos de entrega a errores recuperables."""
     servidor, durante_datos = None, False
     try:
@@ -306,6 +330,9 @@ def _enviar_preparado(remitente, destinatarios, mime):
                     pass
 
 
+#----------------------------------------------
+# FUNCIONES DE RECUPERACIÓN DE CORREOS PENDIENTES
+#----------------------------------------------
 def reintentar_pendientes(*, solo=None, propagar_error=False):
     """Reenvia el MIME conservado; no consulta la web ni invoca el negocio.
 
@@ -315,7 +342,7 @@ def reintentar_pendientes(*, solo=None, propagar_error=False):
     if not configuracion.MODULO_CORREO:
         return {}
     try:
-        return obtener_cola().procesar(_enviar_preparado, solo=solo)
+        return obtener_cola().procesar(enviar_preparado, solo=solo)
     except Exception:
         obtener_logger('CORREO').error('No se pudo revisar la cola de correos; el negocio no se repetira por este fallo')
         if propagar_error:
@@ -323,6 +350,9 @@ def reintentar_pendientes(*, solo=None, propagar_error=False):
         return {}
 
 
+#----------------------------------------------
+# FUNCIONES DE NOTIFICACIONES DEL PROCESO
+#----------------------------------------------
 def notificar(titulo, texto, adjuntos=None, evento="resultados"):
     """Aplica los flags y destinatarios del evento y registra un fallo de envío sin ocultarlo."""
     if not configuracion.MODULO_CORREO:

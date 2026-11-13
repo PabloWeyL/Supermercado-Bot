@@ -16,6 +16,9 @@ from pathlib import Path
 from textwrap import wrap
 
 
+#----------------------------------------------
+# FUNCIONES DE GENERACIÓN DEL REPORTE EXCEL
+#----------------------------------------------
 def generar_resultados_excel():
     """Genera el Excel de resultados e incidencias y su trazabilidad dentro del contexto de ejecución."""
     with contexto():
@@ -58,6 +61,9 @@ def generar_resultados_excel():
         print("Excel de salida creado: " + str(EXCEL_SALIDA) + " (" + str(len(filas)) + " filas)")
 
 
+#----------------------------------------------
+# ERRORES DEL PROCESO
+#----------------------------------------------
 class ErrorProcesoBot(ErrorWeyland):
     def __init__(self, mensaje, resumen=None, estado_bot='ERROR'):
         """Conserva el resumen público y el estado final de un fallo de automatización."""
@@ -66,6 +72,9 @@ class ErrorProcesoBot(ErrorWeyland):
         self.estado_bot = estado_bot
 
 
+#----------------------------------------------
+# FUNCIONES DE RESUMEN DE RESULTADOS Y OBSERVACIONES
+#----------------------------------------------
 def leer_resumen(carpeta):
     """Calcula resultados, observaciones, errores y pendientes desde la base aislada de la ejecución."""
     datos = resumen_ejecucion(RutasEjecucion(carpeta).base_datos)

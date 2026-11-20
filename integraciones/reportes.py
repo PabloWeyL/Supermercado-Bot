@@ -1,9 +1,9 @@
 """Reportes y resumen público de resultados del proceso."""
 
-from config.archivos import RutasEjecucion, guardar_json
-from config.autenticacion import ErrorWeyland
-from config.base_datos import datos_reporte, resumen_ejecucion
-from config.configuracion import EXCEL_SALIDA, RUTA_REPORTES, contexto, metadatos
+from config.archivos import rutas_ejecucion, guardar_json, reemplazar_atomico
+from config.archivos import crear_error_weyland
+from config.base_datos import datos_auditoria_reporte, datos_reporte, resumen_ejecucion
+from config.configuracion import EXCEL_SALIDA, RUTA_REPORTES, contexto, metadatos, obtener_logger
 from config.formato_excel import aplicar_formato_salida_excel
 from integraciones.supermercados import (
     agregar_fila_literal,
@@ -14,11 +14,12 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment
 from pathlib import Path
 from textwrap import wrap
+from uuid import uuid4
 
 
-#----------------------------------------------
+# ======================
 # FUNCIONES DE GENERACIÓN DEL REPORTE EXCEL
-#----------------------------------------------
+# ======================
 def generar_resultados_excel():
     """Genera el Excel de resultados e incidencias y su trazabilidad dentro del contexto de ejecución."""
     with contexto():
@@ -51,33 +52,51 @@ def generar_resultados_excel():
         for campo, valor in datos.items():
             agregar_fila_literal(auditoria, [campo, valor])
         aplicar_formato_salida_excel(auditoria)
+        queue, detalles = datos_auditoria_reporte()
+        for nombre, encabezados, registros in (
+            ('Queue', ('ID EJECUCIÓN', 'ARCHIVO', 'ESTADO', 'MÓDULO ACTUAL', 'ÚLTIMO MÓDULO',
+                       'FECHA CREACIÓN', 'FECHA FIN', 'COMENTARIO'), queue),
+            ('Details', ('ID EJECUCIÓN', 'PRODUCTO', 'SUPERMERCADO', 'ESTADO', 'INTENTOS',
+                         'COMENTARIO', 'FECHA FIN'), detalles),
+            ('Aux', ('PRODUCTO', 'NOMBRE', 'PRECIO', 'URL', 'FECHA', 'SUPERMERCADO', 'MARCA',
+                     'PRECIO MÍNIMO', 'PRECIO MÁXIMO'), encontrados),
+        ):
+            vista = libro.create_sheet(nombre)
+            agregar_fila_literal(vista, encabezados)
+            for registro in registros:
+                agregar_fila_literal(vista, registro)
+            aplicar_formato_salida_excel(vista)
+        salida = Path(EXCEL_SALIDA)
+        temporal = salida.with_name(f'.{salida.stem}_{uuid4().hex}.xlsx')
         try:
-            Path(EXCEL_SALIDA).parent.mkdir(parents=True, exist_ok=True)
-            libro.save(EXCEL_SALIDA)
+            salida.parent.mkdir(parents=True, exist_ok=True)
+            libro.save(temporal)
+            reemplazar_atomico(temporal, salida)
         finally:
             libro.close()
+            temporal.unlink(missing_ok=True)
         nombre = 'trazabilidad_' + str(datos.get('activacion_id') or 'sin_activacion') + '.json'
         guardar_json(Path(EXCEL_SALIDA).parent / nombre, datos)
-        print("Excel de salida creado: " + str(EXCEL_SALIDA) + " (" + str(len(filas)) + " filas)")
+        obtener_logger("REPORTE").info("EXCEL DE SALIDA GENERADO CON %s FILAS", len(filas))
 
 
-#----------------------------------------------
+# ======================
 # ERRORES DEL PROCESO
-#----------------------------------------------
-class ErrorProcesoBot(ErrorWeyland):
-    def __init__(self, mensaje, resumen=None, estado_bot='ERROR'):
-        """Conserva el resumen público y el estado final de un fallo de automatización."""
-        super().__init__(mensaje)
-        self.resumen_publico = resumen
-        self.estado_bot = estado_bot
+# ======================
+def crear_error_proceso_bot(mensaje, resumen=None, estado_bot='ERROR'):
+    """Conserva el resumen y el estado final que se pueden publicar en Weyland."""
+    error = crear_error_weyland(mensaje)
+    error.resumen_publico = resumen
+    error.estado_bot = estado_bot
+    return error
 
 
-#----------------------------------------------
+# ======================
 # FUNCIONES DE RESUMEN DE RESULTADOS Y OBSERVACIONES
-#----------------------------------------------
+# ======================
 def leer_resumen(carpeta):
     """Calcula resultados, observaciones, errores y pendientes desde la base aislada de la ejecución."""
-    datos = resumen_ejecucion(RutasEjecucion(carpeta).base_datos)
+    datos = resumen_ejecucion(rutas_ejecucion(carpeta).base_datos)
     if datos is None:
         return None
     tareas = datos['tareas']

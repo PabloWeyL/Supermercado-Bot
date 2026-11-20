@@ -1,10 +1,12 @@
 # RPA de supermercados
 
+## ¿Qué hace este proceso?
+
 Consulta productos, genera un reporte Excel y se conecta a Weyland Automate mediante JWT. Se ejecuta con `python main.py` o `ejecutar.bat`.
 
 ## Arquitectura
 
-El proyecto tiene 11 archivos Python organizados por responsabilidad:
+El código se organiza por responsabilidad:
 
 ```text
 main.py                       Orquestación, módulos, reintentos y comandos
@@ -14,10 +16,10 @@ config/
   correo.py                   SMTP y cola persistente de notificaciones
   formato_excel.py            Estilos del reporte
   archivos.py                 Constantes, rutas, huellas y persistencia atómica
-  autenticacion.py            JWT BOT, renovación y cierre
-  backend.py                  Endpoints, asignación, input y entrega HTTP
-  ejecuciones.py              Estados, checkpoints y recuperación
+  fallos.py                   Diagnóstico de errores por ejecución
+  monitor.py                  Parámetros de la solicitud web
 integraciones/
+  weyland.py                  Sesión JWT, cliente HTTP, estados, checkpoints y entrega
   supermercados.py           Entradas, catálogo, Chrome y búsqueda de productos
   reportes.py                 Excel de salida y resumen del proceso
 input/
@@ -80,7 +82,6 @@ BACKEND_API_URL=https://automate.example.com/api
 BACKEND_BOT_LOGIN_RUTA=/bot/sesion
 BACKEND_BOT_REFRESH_RUTA=/bot/sesion/renovar
 BACKEND_BOT_CERRAR_RUTA=/bot/sesion/cerrar
-BACKEND_MAQUINA_ID=1
 BACKEND_PROCESO_CODIGO=SUPERMERCADOS
 BACKEND_TRABAJOS_DIR=temporales/weyland
 BACKEND_REUTILIZAR_ULTIMA=false
@@ -90,9 +91,9 @@ BACKEND_REFRESH_MARGEN_SEGUNDOS=60
 
 El ID y código del ejemplo deben corresponder a registros reales. Para producción, usar HTTPS, `ENTORNO=PRODUCCION` y un directorio operativo fuera del repositorio. HTTP se admite solo en loopback con `BACKEND_PERMITIR_HTTP_LOCAL=true`.
 
-Las credenciales estandarizadas son `WEYLAND_AUTOMATE_MVTESTING_USER` y `WEYLAND_AUTOMATE_MVTESTING_PWD`; empresa y VM se resuelven mediante `CREDENCIALES_EMPRESA` y `CREDENCIALES_VM`. No se utiliza API key en el arranque actual.
+Define una API key activa en `BACKEND_API_KEY` mediante el entorno privado del bot y conserva `BACKEND_BOT_AUTH_MODE=jwt`. `POST /api/bot/sesion` recibe `api_key` y `resolver_maquina_por_ip: true`. El bot usa los tokens JWT devueltos para las peticiones siguientes.
 
-El bot inicia sesión directamente con `POST /api/bot/sesion`, enviando correo, contraseña y el ID de máquina configurado. Conserva `access_token`, `refresh_token` y su vencimiento únicamente en memoria; envía `Authorization: Bearer <access_token>` a `/api/bot/*`. El cliente utiliza exclusivamente la sesión JWT BOT. El refresh rota ambos tokens; si su respuesta se pierde, no se reutiliza el anterior. Al cerrar el cliente se intenta cerrar la sesión BOT y siempre se limpian sus tokens.
+La toma de la solicitud conserva su ID numérico y su checkpoint. Antes de publicar `EN_EJECUCION` o `EN_REPROCESO`, el bot envía `{"id_ejecucion":"19112026_093507"}` a `POST /api/bot/ejecuciones/{id}/id-ejecucion`. El valor se genera con la hora local del equipo en formato `DDMMYYYY_HHMMSS`. Ante una respuesta incierta, el bot conserva la solicitud y el valor en el checkpoint. Verifica ese ID en Weyland Automate antes de conciliar el checkpoint.
 
 El contrato actual toma una solicitud por invocación. Un HTTP 204 termina sin trabajo. No se reutiliza la última solicitud ni se inventan IDs. Se admiten `input: null` y productos JSON en parámetros cuando corresponda.
 
@@ -144,7 +145,7 @@ Configurar `RPA_CHROME_URL=http://127.0.0.1:9222` en `.env`. Esta dirección cor
 
 ## Configuración operativa en .env
 
-Las credenciales de Automate y SMTP continúan en las variables privadas estandarizadas. No se incorporan contraseñas ni tokens al código, al catálogo ni a la plantilla. Los tokens JWT siguen siendo temporales y permanecen en memoria.
+La API key de Automate y las credenciales SMTP se mantienen en el entorno privado. No se incorporan contraseñas ni tokens al código, al catálogo ni a la plantilla. Los tokens JWT siguen siendo temporales y permanecen en memoria.
 
 Las URLs de tiendas se configuran mediante `SUPERMERCADO_LIDER_URL`, `SUPERMERCADO_TOTTUS_URL` y `SUPERMERCADO_UNIMARC_URL`. Lider conserva el marcador literal `{termino}` para construir cada búsqueda. Las esperas de cada tienda usan `SUPERMERCADO_<TIENDA>_ESPERA` y, cuando corresponde, `SUPERMERCADO_<TIENDA>_ESPERA_RESULTADOS`. El catálogo JSON contiene sus nombres de variable y los selectores DOM.
 
@@ -203,3 +204,29 @@ Los `ContextVar` definidos en los módulos son claves estables de contexto; las 
 La conexión usa una sola excepción, `ErrorWeyland`, con `tipo` (`HTTP`, `RED`, `CONTRATO`, `ASIGNACION_INCOMPATIBLE` o `SIN_PENDIENTES`), `status_code` y `ejecucion_id` cuando corresponden. El coordinador distingue las categorías para conservar checkpoints y evitar operaciones duplicadas. HTTP 204 sin trabajo sigue siendo una finalización normal.
 
 La autenticación del frontend y la compatibilidad con API key fueron retiradas del cliente; se mantienen login, refresh y cierre JWT sobre `/api/bot/*`.
+
+## Operación en desarrollo
+
+El perfil de Supermercado usa SQLite. Python 3.14.7 es la versión comprobada para esta actualización. Los parámetros web vienen de Weyland Automate. `RUTA_LOGS` controla el log mensual y `RUTA_HISTORICO` indica dónde guardar los respaldos ZIP. Los fallos se registran localmente como `fallos/FALLO_<ID>_<HHMMSS_mmm>.md`. La plantilla incrusta el favicon de Weyland como logo del cliente y de Weyland. El estado final de éxito del detalle es `LEIDO`.
+
+## Pruebas y validación
+
+Desde el entorno virtual, ejecuta `python -m unittest discover -s pruebas -v`, `python -m compileall -q .`, `python main.py --help` y `python -m pip check`. En la VM de pruebas, valida el flujo visual con una cuenta de prueba y entradas controladas.
+
+La migración SQLite renombra las tablas de archivos, tareas y resultados a QUEUE_SUPERMERCADOS, DETAILS_SUPERMERCADOS y AUX_SUPERMERCADOS_RESULTADOS. Conserva los registros y convierte los estados al esquema Weyland. La Queue pasa por `PENDIENTE`, `EN_EJECUCION`, `PROCESADO`, `FINALIZADO` o `ERROR`. Los Details registran `PENDIENTE`, `LEIDO` o `ERROR`. La confirmación de entrega cierra la Queue. Si queda correo pendiente, usa `correos-estado`, `correos-reintentar` o `correos-resolver`.
+
+## Estándar Weyland v1.2.0
+
+El perfil validado localmente usa SQLite. Los parámetros de trabajo vienen de Weyland Automate durante esta etapa. La integración con Weyland Monitor mediante sus procedimientos en Azure SQL y la adopción de Key Vault quedan fuera del perfil acordado. La prueba visual con cuenta de prueba y la verificación del despliegue siguen pendientes.
+
+Los archivos de fallo guardan un diagnóstico mínimo local. El correo de error identifica la ejecución sin adjuntar el log mensual.
+
+Si `ID_EJECUCION` apunta a una ejecución con estado `FINALIZADO` o `ERROR`, el bot registra el ID y el estado y termina con código 0 antes del correo inicial, los módulos y la toma de solicitudes. Los reintentos de una ejecución abierta usan su misma Queue. Un reproceso deliberado comienza con un ID nuevo. Deja ID_EJECUCION vacío después de reanudar y antes de volver a usar el arranque programado.
+
+Las plantillas de configuración dejan los módulos desactivados. Para una prueba controlada, habilita MODULO_AUTOMATIZACION_SUPERMERCADOS en el entorno de pruebas.
+
+Al reanudar una ejecución abierta, se conserva su Queue y se omite el aviso inicial. Si el reporte ya existe, el cierre reutiliza el Excel y la confirmación de correo registrados para ese ID.
+
+Weyland detecta la máquina por la IP pública de salida registrada y devuelve su ID al abrir la sesión. Los checkpoints conservan sus carpetas por ID numérico. Si la IP es desconocida o está registrada en varias máquinas, el bot se detiene antes de consultar la cola.
+
+Para una sesión con el contrato que recibe el ID explícito, usa `ejecutar.bat api-verificar --maquina-id NUMERO` para verificar el acceso y `ejecutar.bat web-procesar --maquina-id NUMERO` para tomar la siguiente solicitud de esa máquina. El número se aplica solo a esa corrida. Usa el ID que muestra el portal y confirma primero el orden de la cola.

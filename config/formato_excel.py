@@ -4,18 +4,18 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 
-RELLENO_ENCABEZADO = PatternFill("solid", fgColor="1F4E78")
+RELLENO_ENCABEZADO = PatternFill("solid", fgColor="001A71")
 
 
-FUENTE_ENCABEZADO = Font(bold=True, color="FFFFFF")
+FUENTE_ENCABEZADO = Font(name="Calibri", size=12, bold=True, color="FFFFFF")
 
 
 ALINEACION_ENCABEZADO = Alignment(horizontal="center", vertical="center")
 
 
-#----------------------------------------------
+# ======================
 # FUNCIONES DE FORMATO DE EXCEL
-#----------------------------------------------
+# ======================
 def aplicar_formato_salida_excel(hoja, congelar=True, autofiltro=True, ancho_max=45):
     "formato de excel para generar los resultados"
     if hoja.max_row < 1:

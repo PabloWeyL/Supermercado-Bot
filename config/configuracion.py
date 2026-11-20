@@ -1,7 +1,10 @@
 """Configuración central, credenciales, trazabilidad, logs y validaciones."""
 
+from config.archivos import crear_error_clasificado
+
 import ipaddress
 import logging
+from config.fallos import filtrar_excepcion, limpiar_archivos_antiguos, preparar_consola
 import math
 import os
 import re
@@ -22,8 +25,6 @@ from uuid import uuid4
 
 
 CAMPOS = {
-    'BACKEND_EMAIL': ('AUTOMATE', 'USER'),
-    'BACKEND_PASSWORD': ('AUTOMATE', 'PWD'),
     'EMAIL_REMITENTE': ('SMTP', 'USER'),
     'EMAIL_PASSWORD': ('SMTP', 'PWD'),
     'MONITOR_USER': ('MONITOR', 'USER'),
@@ -36,9 +37,9 @@ CAMPOS = {
 IDENTIDAD = ('CREDENCIALES_EMPRESA', 'CREDENCIALES_VM')
 
 
-#----------------------------------------------
+# ======================
 # FUNCIONES DE CREDENCIALES Y CONFIGURACIÓN
-#----------------------------------------------
+# ======================
 def nombres_estandar(valores):
     """Calcula los nombres de credenciales según la empresa y la máquina configuradas."""
     empresa = str(valores.get('CREDENCIALES_EMPRESA') or '').strip().upper()
@@ -88,9 +89,9 @@ CONTEXTO_EJECUCION = ContextVar('contexto_bot', default=None)
 IDENTIFICADOR_LOCAL = ContextVar('identificador_local', default=None)
 
 
-#----------------------------------------------
+# ======================
 # FUNCIONES DE CONTEXTO Y TRAZABILIDAD
-#----------------------------------------------
+# ======================
 def actual():
     """Recupera el contexto vigente o construye sus identificadores desde el entorno."""
     guardado = CONTEXTO_EJECUCION.get()
@@ -133,9 +134,9 @@ def metadatos():
 load_dotenv(ARCHIVO_ENV)
 
 
-#----------------------------------------------
+# ======================
 # FUNCIONES DE RESOLUCIÓN DE LA RUTA BASE
-#----------------------------------------------
+# ======================
 def resolver_ruta_base(valor):
     """Resuelve la raíz operativa absoluta usando la carpeta del proyecto cuando corresponde."""
     valor =(valor or "").strip()
@@ -149,8 +150,10 @@ def resolver_ruta_base(valor):
 
 RUTA_BASE = resolver_ruta_base(os.getenv("RUTA_BASE"))
 RUTA_CONFIG = RUTA_PROYECTO / "config"
-RUTA_LOGS = RUTA_BASE / "logs"
-RUTA_RECURSOS = RUTA_BASE / "recursos"
+RUTA_LOGS = (RUTA_BASE / os.getenv("RUTA_LOGS", "logs")).resolve()
+RUTA_HISTORICO = (RUTA_BASE / os.getenv("RUTA_HISTORICO", "historico")).resolve()
+RUTA_LOG_ACTUAL = None
+RUTA_RECURSOS = RUTA_PROYECTO / "recursos"
 RUTA_IMAGENES = RUTA_RECURSOS / "imagenes"
 RUTA_TEMPLATES = RUTA_RECURSOS / "templates"
 RUTA_PROCESADOS = RUTA_BASE / "procesados"
@@ -158,9 +161,9 @@ RUTA_REPORTES = RUTA_BASE / "reportes"
 RUTA_TEMPORALES = RUTA_BASE / "temporales"
 
 
-#----------------------------------------------
+# ======================
 # FUNCIONES DE LECTURA Y VALIDACIÓN DE VARIABLES
-#----------------------------------------------
+# ======================
 def obtener_variable_opcional(nombre, defecto=None):
     """Lee una variable o credencial normalizada y utiliza el valor predeterminado si está vacía."""
     valor = (leer_credencial(nombre) if nombre.upper() in CAMPOS
@@ -285,9 +288,9 @@ if not 1 <= RPA_CHROME_PUERTO <= 65535:
     raise RuntimeError("RPA_CHROME_PUERTO debe estar entre 1 y 65535")
 
 
-#----------------------------------------------
+# ======================
 # FUNCIONES DE VALIDACIÓN DE CHROME
-#----------------------------------------------
+# ======================
 def validar_url_chrome(valor):
     """Acepta una dirección HTTP local sin credenciales, rutas ni parámetros."""
     try:
@@ -315,11 +318,12 @@ LISTA_DISTRIBUCION_ERROR = os.getenv("LISTA_DISTRIBUCION_ERROR", "")
 EXCEL_SALIDA = ruta_proyecto(obtener_variable_opcional("EXCEL_SALIDA"),"reportes/resultados.xlsx")
 CARPETA_CAPTURAS = ruta_proyecto(obtener_variable_opcional("CARPETA_CAPTURAS"), "procesados/capturas")
 RETENCIONES_LOGS_MESES = obtener_entero_positivo("RETENCION_LOGS_MESES", 6)
+RETENCION_HISTORICO_MESES = obtener_entero_positivo("RETENCION_HISTORICO_MESES", 18)
 
 
-#----------------------------------------------
+# ======================
 # FUNCIONES DE LOGGING Y RETENCIÓN
-#----------------------------------------------
+# ======================
 class FiltroContexto(logging.Filter):
     def filter(self, record):
         """Añade al registro de log los identificadores y el módulo de la ejecución actual."""
@@ -331,16 +335,19 @@ class FiltroContexto(logging.Filter):
             record.id_ejecucion = "SIN_ID"
         if not hasattr(record, "modulo"):
             record.modulo = "CONFIGURACIÓN"
-        return True
+        record.modulo = str(record.modulo).replace("_", " ").upper()
+        return filtrar_excepcion(record)
 
 
 def configurar_logging():
     """Configura el log mensual, su formato de trazabilidad y la retención de archivos antiguos."""
+    global RUTA_LOG_ACTUAL
     RUTA_LOGS.mkdir(parents=True, exist_ok=True)
 
     nombre_log = NOMBRE_PROCESO.lower().replace(" ", "_")
     ruta_log = RUTA_LOGS / f"{nombre_log}_{datetime.now():%Y_%m}.log"
 
+    RUTA_LOG_ACTUAL = ruta_log
     logger = logging.getLogger(NOMBRE_PROCESO)
     logger.setLevel(logging.INFO)
     logger.propagate = False
@@ -350,9 +357,9 @@ def configurar_logging():
         handler.close()
 
     formato = logging.Formatter(
-        "%(asctime)s [%(levelname)s] [%(name)s] [ID_LOCAL:%(id_ejecucion)s] "
+        "%(asctime)s [%(levelname)s] [%(name)s] [ID:%(id_ejecucion)s] [%(modulo)s] "
         "[SOLICITUD:%(solicitud_id)s] [EJECUCION_WEB:%(ejecucion_web_id)s] "
-        "[ACTIVACION:%(activacion_id)s] [%(modulo)s] %(message)s",
+        "[ACTIVACION:%(activacion_id)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 
@@ -369,9 +376,10 @@ def configurar_logging():
     logger.addHandler(consola)
     logger.addHandler(archivo)
 
-    logger.info("Log mensual configurado.")
+    obtener_logger("CONFIGURACIÓN").info('LOG MENSUAL CONFIGURADO.')
 
     limpiar_logs_antiguos(logger, ruta_log)
+    limpiar_archivos_antiguos(RUTA_PROYECTO / "fallos", "FALLO_*.md", RETENCIONES_LOGS_MESES)
 
 
 def limpiar_logs_antiguos(logger, ruta_log_actual):
@@ -393,13 +401,13 @@ def limpiar_logs_antiguos(logger, ruta_log_actual):
 
             if antiguedad_meses >= RETENCIONES_LOGS_MESES:
                 ruta_log.unlink()
-                logger.info(f"Archivo de log antiguo eliminado: {ruta_log.name}")
+                logger.info(f'ARCHIVO DE LOG ANTIGUO ELIMINADO: {ruta_log.name}')
 
         except (ValueError, IndexError):
-            logger.warning(f"No se pudo determinar la fecha del archivo de log: {ruta_log.name}")
+            logger.warning(f'NO SE PUDO DETERMINAR LA FECHA DEL ARCHIVO DE LOG: {ruta_log.name}')
 
         except Exception:
-            logger.exception(f"No se pudo eliminar el archivo de log antiguo: {ruta_log.name}")
+            logger.exception(f'NO SE PUDO ELIMINAR EL ARCHIVO DE LOG ANTIGUO: {ruta_log.name}')
 
 
 def obtener_logger(modulo, id_ejecucion_logger=None):
@@ -410,18 +418,19 @@ def obtener_logger(modulo, id_ejecucion_logger=None):
             id_ejecucion_logger = "SIN_ID"
 
     logger = logging.getLogger(NOMBRE_PROCESO)
+    preparar_consola(logger)
     return logging.LoggerAdapter(
         logger,
         {
             "id_ejecucion": id_ejecucion_logger,
-            "modulo": modulo
+            "modulo": str(modulo).replace("_", " ").upper()
         }
     )
 
 
-#----------------------------------------------
+# ======================
 # FUNCIONES DE FECHA Y REGISTRO
-#----------------------------------------------
+# ======================
 def ahora():
     """Devuelve la fecha y hora local en el formato utilizado por la base de datos."""
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -451,26 +460,42 @@ def ambito_identificacion():
         IDENTIFICADOR_LOCAL.reset(token)
 
 
-#----------------------------------------------
+# ======================
 # FUNCIONES DE CONFIGURACIÓN INICIAL
-#----------------------------------------------
+# ======================
+def interpretar_id_ejecucion(valor):
+    """Admite el ID fechado y los identificadores guardados por versiones anteriores."""
+
+    if not valor:
+        return None
+    if valor.isdecimal() and int(valor) > 0:
+        return int(valor)
+    if re.fullmatch(r"[a-f0-9]{32}", valor):
+        return valor
+    try:
+        id_ejecucion = datetime.strptime(valor, "%d%m%Y_%H%M%S").strftime("%d%m%Y_%H%M%S")
+    except ValueError as error:
+        raise RuntimeError("ID_EJECUCION DEBE TENER FORMATO DDMMAAAA_HHMMSS") from error
+    if id_ejecucion != valor:
+        raise RuntimeError("ID_EJECUCION DEBE TENER FORMATO DDMMAAAA_HHMMSS")
+    return id_ejecucion
+
+
 def configuracion_inicial():
     """Inicia logging, verifica SQLite e inicializa la base y la identificación del proceso."""
     id_ejecucion = None
     configurar_logging()
+    if obtener_variable_opcional("ENTORNO", "DESARROLLO").upper() != "DESARROLLO":
+        raise ValueError("ENTORNO debe ser DESARROLLO mientras se usa SQLite")
+    if obtener_variable_opcional("MOTOR_BD", "sqlite").lower() != "sqlite":
+        raise ValueError("MOTOR_BD debe ser sqlite en DESARROLLO")
     revisar_integridad(RUTA_DB_SQLITE)
     configurar_base_datos(RUTA_DB_SQLITE)
     logger = obtener_logger("CONFIGURACIÓN")
     logger.info("INICIANDO CONFIGURACIÓN INICIAL")
 
-    if ID_EJECUCION_ENV:
-        try:
-            id_ejecucion = int(ID_EJECUCION_ENV)
-        except ValueError as exc:
-            raise RuntimeError("ID_EJECUCION debe ser un numero entero") from exc
-        logger.info(f"CONFIGURAR INICIO CON ID_EJECUCION: {id_ejecucion}")
-    else:
-        logger.info("CONFIGURAR INICIO SIN ID_EJECUCION")
+    id_ejecucion = interpretar_id_ejecucion(ID_EJECUCION_ENV)
+    logger.info("ID DE EJECUCIÓN: %s", id_ejecucion or "SIN_ID")
     IDENTIFICADOR_LOCAL.set(id_ejecucion)
     logger = obtener_logger("CONFIGURACIÓN", id_ejecucion)
     logger.info("CONFIGURACIÓN INICIAL FINALIZADA CORRECTAMENTE")
@@ -483,11 +508,11 @@ MODULO_AUTOMATIZACION_SUPERMERCADOS = obtener_booleano(
     "MODULO_AUTOMATIZACION_SUPERMERCADOS", obtener_booleano("MODULO_SCRAPING", True))
 MODULO_SCRAPING = MODULO_AUTOMATIZACION_SUPERMERCADOS
 
-#----------------------------------------------
+# ======================
 # ERRORES Y VALIDACIONES DE ARRANQUE
-#----------------------------------------------
-class ErrorArranque(RuntimeError):
-    pass
+# ======================
+def crear_error_arranque(mensaje):
+    return crear_error_clasificado(mensaje, 'ErrorArranque')
 
 
 def probar_directorio(ruta):
@@ -503,16 +528,15 @@ def validar_configuracion(config):
     for nombre in ('RPA_TIMEOUT', 'RPA_ESPERA_MAX', 'MAX_REINTENTOS', 'MAX_REINTENTOS_CORREO', 'RETENCIONES_LOGS_MESES'):
         valor = getattr(config, nombre)
         if isinstance(valor, bool) or not isinstance(valor, (int, float)) or not math.isfinite(valor) or valor <= 0:
-            raise ErrorArranque(f'{nombre} debe ser un numero positivo y finito')
+            raise crear_error_arranque(f'{nombre} debe ser un numero positivo y finito')
     if config.REINTENTOS_MAX < 0:
-        raise ErrorArranque('REINTENTOS_MAX no puede ser negativo')
-    if config.ID_EJECUCION_ENV and (not config.ID_EJECUCION_ENV.isdecimal() or int(config.ID_EJECUCION_ENV) < 1):
-        raise ErrorArranque('ID_EJECUCION debe ser un entero positivo o estar vacio')
+        raise crear_error_arranque('REINTENTOS_MAX no puede ser negativo')
+    interpretar_id_ejecucion(config.ID_EJECUCION_ENV)
     for nombre in ('MODULO_AUTOMATIZACION_SUPERMERCADOS', 'MODULO_SCRAPING', 'MODULO_CORREO', 'MODULO_CORREO_INICIAL', 'RPA_HEADLESS'):
         valor = os.getenv(nombre)
         if valor is not None and valor.strip() and valor.strip().upper() not in (
                 'TRUE', 'SI', '1', 'YES', 'Y', 'FALSE', 'NO', '0', 'N'):
-            raise ErrorArranque(f'{nombre} contiene un booleano invalido')
+            raise crear_error_arranque(f'{nombre} contiene un booleano invalido')
     for ruta in (config.RUTA_LOGS, config.RUTA_REPORTES, config.RUTA_TEMPORALES,
                  Path(config.RUTA_DB_SQLITE).parent, Path(config.EXCEL_SALIDA).parent,
                  Path(config.CARPETA_CAPTURAS)):
@@ -520,26 +544,26 @@ def validar_configuracion(config):
     if config.MODULO_CORREO:
         for nombre in ('smtp_server', 'email_remitente', 'email_password'):
             if not config.obtener_variable_opcional(nombre):
-                raise ErrorArranque(f'Correo habilitado pero falta {nombre}; configurar o desactivar MODULO_CORREO')
+                raise crear_error_arranque(f'Correo habilitado pero falta {nombre}; configurar o desactivar MODULO_CORREO')
         try:
             puerto = int(config.obtener_variable_opcional('smtp_port', '587'))
         except ValueError:
-            raise ErrorArranque('smtp_port debe ser un entero') from None
+            raise crear_error_arranque('smtp_port debe ser un entero') from None
         if not 1 <= puerto <= 65535 or not config.LISTA_DISTRIBUCION_ERROR.strip():
-            raise ErrorArranque('Revisar smtp_port y LISTA_DISTRIBUCION_ERROR del correo habilitado')
+            raise crear_error_arranque('Revisar smtp_port y LISTA_DISTRIBUCION_ERROR del correo habilitado')
 
 
 
 def validar_dependencias(raiz):
     """Comprueba las versiones de Python y Node.js y localiza un ejecutable de Chrome."""
     if sys.version_info < (3, 11):
-        raise ErrorArranque('Se requiere Python 3.11 o posterior')
+        raise crear_error_arranque('Se requiere Python 3.11 o posterior')
     nodo = shutil.which('node')
     if not nodo:
-        raise ErrorArranque('Falta Node.js 22 o posterior en PATH')
+        raise crear_error_arranque('Falta Node.js 22 o posterior en PATH')
     resultado = subprocess.run([nodo, '--version'], capture_output=True, text=True, timeout=DEPENDENCIAS_TIMEOUT, check=True)
     if int(resultado.stdout.strip().lstrip('v').split('.')[0]) < 22:
-        raise ErrorArranque('Se requiere Node.js 22 o posterior')
+        raise crear_error_arranque('Se requiere Node.js 22 o posterior')
     candidatos = [os.getenv('CHROME_PATH'),
         r'C:\Program Files\Google\Chrome\Application\chrome.exe',
         r'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe',
@@ -547,7 +571,7 @@ def validar_dependencias(raiz):
         shutil.which('google-chrome'), shutil.which('chromium')]
     chrome = next((p for p in candidatos if p and Path(p).is_file()), None)
     if not chrome:
-        raise ErrorArranque('No se encontro Chrome; configurar CHROME_PATH')
+        raise crear_error_arranque('No se encontro Chrome; configurar CHROME_PATH')
     return str(Path(chrome).resolve())
 
 
@@ -559,9 +583,9 @@ def revisar_integridad(ruta):
     # mode=ro revisa la base existente sin crearla ni migrarla.
     with closing(sqlite3.connect(ruta.resolve().as_uri() + '?mode=ro', uri=True, timeout=DB_TIMEOUT)) as conexion:
         if conexion.execute('PRAGMA quick_check').fetchall() != [('ok',)]:
-            raise ErrorArranque('La base SQLite no supera quick_check; restaurar o revisar antes de ejecutar')
+            raise crear_error_arranque('La base SQLite no supera quick_check; restaurar o revisar antes de ejecutar')
         if conexion.execute('PRAGMA foreign_key_check').fetchall():
-            raise ErrorArranque('La base SQLite contiene referencias invalidas')
+            raise crear_error_arranque('La base SQLite contiene referencias invalidas')
 
 
 def revisar_base_operativa(config):
@@ -569,22 +593,22 @@ def revisar_base_operativa(config):
     from config import base_datos as bd
     revisar_integridad(config.RUTA_DB_SQLITE)
     requeridas = {
-        'details': {'id', 'archivo', 'ruta', 'estado', 'error', 'fecha_creacion', 'fecha_fin'},
-        'cola': {'id', 'detail_id', 'producto', 'supermercado', 'marca', 'precio_minimo',
+        'QUEUE_SUPERMERCADOS': {'id', 'archivo', 'ruta', 'estado', 'error', 'fecha_creacion', 'fecha_fin'},
+        'DETAILS_SUPERMERCADOS': {'id', 'detail_id', 'producto', 'supermercado', 'marca', 'precio_minimo',
                  'precio_maximo', 'estado', 'reintentos', 'error', 'fecha_creacion', 'fecha_fin'},
-        'resultados': {'id', 'cola_id', 'supermercado', 'producto', 'nombre', 'precio', 'url', 'fecha'},
+        'AUX_SUPERMERCADOS_RESULTADOS': {'id', 'cola_id', 'supermercado', 'producto', 'nombre', 'precio', 'url', 'fecha'},
     }
     with closing(bd.obtener_db_conexion_sql3()) as conexion:
-        if conexion.execute('PRAGMA user_version').fetchone()[0] != 3:
-            raise ErrorArranque('Version de esquema SQLite incompatible')
+        if conexion.execute('PRAGMA user_version').fetchone()[0] != bd.VERSION_ESQUEMA:
+            raise crear_error_arranque('Version de esquema SQLite incompatible')
         for tabla, columnas in requeridas.items():
             presentes = {fila[1] for fila in conexion.execute('PRAGMA table_info(' + tabla + ')')}
             if not columnas <= presentes:
-                raise ErrorArranque(f'La tabla {tabla} no tiene todas sus columnas requeridas')
+                raise crear_error_arranque(f'La tabla {tabla} no tiene todas sus columnas requeridas')
         indices = {fila[0] for fila in conexion.execute("SELECT name FROM sqlite_master WHERE type='index'")}
         if not {'idx_cola_filtros', 'idx_details_estado', 'idx_cola_estado', 'idx_cola_detail',
                 'idx_resultados_busqueda', 'idx_resultados_cola'} <= indices:
-            raise ErrorArranque('Faltan indices de la base operativa')
+            raise crear_error_arranque('Faltan indices de la base operativa')
         # Comprobar bloqueo de escritura sin insertar, borrar ni cambiar tareas.
         conexion.execute('BEGIN IMMEDIATE')
         conexion.rollback()

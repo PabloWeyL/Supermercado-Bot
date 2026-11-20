@@ -206,3 +206,17 @@ test-results/
 /tests/
 *.md
 !README.md
+
+# Diagnósticos locales y estructura Weyland.
+/fallos/
+!/AGENTS.md
+!/CHANGELOG.md
+!/CONTRIBUTING.md
+!/DEPLOYMENTS.md
+!/.github/pull_request_template.md
+!/recursos/imagenes/
+!/recursos/imagenes/README.md
+!/GUIA_CONEXION_WEYLAND.md
+
+!/recursos/imagenes/logo_cliente.png
+!/recursos/imagenes/logo_weyland.png

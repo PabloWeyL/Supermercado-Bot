@@ -65,6 +65,53 @@ class PruebasWeyland(unittest.TestCase):
                 http.request.assert_called_once()
                 self.assertEqual(http.request.call_args.kwargs['json'], {'api_key': clave, 'maquina_id': maquina})
 
+    def test_maquina_guardada_solo_si_weyland_la_confirma_y_para_el_mismo_backend(self):
+        clave = 'wak_' + '0' * 12 + '_' + 'x' * 43
+        valores = {'BACKEND_API_URL': 'https://automate.example/api', 'BACKEND_API_KEY': clave}
+        cliente = Mock()
+        cliente.config = {'url': valores['BACKEND_API_URL'], 'bot_maquina_id': 3}
+        cliente.sesion._weyland = {'maquina_id': 1}
+        with tempfile.TemporaryDirectory() as temporal, patch.object(weyland, 'leer_valores', return_value=valores), \
+                patch.object(weyland, 'consultar_ipv4_publica', return_value='8.8.4.4'):
+            raiz = Path(temporal)
+            ruta = raiz / '.runtime/maquina_weyland.json'
+            archivo = raiz / '.env'
+            self.assertIsNone(weyland.crear_cliente_api(archivo).config['bot_maquina_id'])
+            with self.assertRaises(RuntimeError):
+                weyland.guardar_maquina_verificada(raiz, cliente, 3, "8.8.4.4")
+            self.assertFalse(ruta.exists())
+            cliente.sesion._weyland['maquina_id'] = 3
+            weyland.guardar_maquina_verificada(raiz, cliente, 3, "8.8.4.4")
+            self.assertNotIn(clave, ruta.read_text(encoding='utf-8'))
+            self.assertEqual(weyland.crear_cliente_api(archivo).config['bot_maquina_id'], 3)
+            self.assertEqual(weyland.crear_cliente_api(archivo, maquina_id=7).config['bot_maquina_id'], 7)
+            valores['BACKEND_API_URL'] = 'https://otro.example/api'
+            with self.assertRaisesRegex(RuntimeError, 'otro backend'):
+                weyland.crear_cliente_api(archivo)
+
+    def test_ipv4_incompatible_bloquea_la_toma_y_el_trabajo_de_otra_red(self):
+        clave = 'wak_' + '0' * 12 + '_' + 'x' * 43
+        config = {'BACKEND_API_URL': 'https://automate.example/api', 'BACKEND_API_KEY': clave}
+        transporte = Mock()
+        cliente = weyland.crear_cliente_cola(config, session=transporte, maquina_id=3)
+        cliente.ipv4_esperada = '8.8.4.4'
+        with patch.object(weyland, 'consultar_ipv4_publica', return_value='1.1.1.1'):
+            with self.assertRaisesRegex(RuntimeError, 'no coincide'):
+                cliente.verificar_ipv4()
+        with self.assertRaisesRegex(RuntimeError, 'antes de tomar'):
+            cliente.tomar_siguiente(3, 'a' * 32)
+        transporte.request.assert_not_called()
+        datos = {'ejecucion_id': 40051, 'id_externo': 'a' * 32,
+                 'maquina': {'id': 3, 'direccion_ip': '1.1.1.1'},
+                 'proceso': {'codigo': 'SUPERMERCADOS'}, 'parametros': {}, 'inputs': []}
+        with patch.object(weyland, 'consultar_ipv4_publica', return_value='8.8.4.4'):
+            cliente.verificar_ipv4()
+        with self.assertRaisesRegex(RuntimeError, 'IPv4 de la asignacion'):
+            cliente.validar_asignacion(datos, 3, 'a' * 32, {'SUPERMERCADOS'})
+        datos['maquina']['direccion_ip'] = '8.8.4.4'
+        self.assertEqual(cliente.validar_asignacion(datos, 3, 'a' * 32, {'SUPERMERCADOS'})['ejecucion_id'], 40051)
+        transporte.request.assert_not_called()
+
     def test_cola_configurada_usa_la_maquina_de_la_sesion_y_conserva_su_carpeta(self):
         valores = {'BACKEND_CONTRATO': 'cola_actual', 'BACKEND_AUTH_MODE': 'weyland',
                    'BACKEND_MAQUINA_ID': '7'}

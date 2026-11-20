@@ -43,3 +43,7 @@ Los puntos de entrada comprueban ID_EJECUCION en modo de solo lectura antes de e
 Weyland detecta la máquina por la IP pública de salida registrada y devuelve su ID al abrir la sesión. Los checkpoints conservan sus carpetas por ID numérico. Si la IP es desconocida o está registrada en varias máquinas, el bot se detiene antes de consultar la cola.
 
 El arranque web y la verificación aceptan `--maquina-id` como opción explícita por corrida. La sesión debe confirmar esa misma máquina antes de acceder a la cola.
+
+El arranque sin argumentos usa la máquina local previamente confirmada con `api-verificar --maquina-id NUMERO --ipv4-publica IPV4 --guardar-maquina` cuando existe. El vínculo se guarda en `.runtime/maquina_weyland.json`, queda fuera de Git y es específico del backend.
+
+Comprueba la IPv4 pública antes del POST siguiente y valida maquina.direccion_ip antes de correr el negocio.

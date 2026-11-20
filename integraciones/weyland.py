@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
 from base64 import urlsafe_b64decode
+from ipaddress import IPv4Address
 import hashlib
 import json
 import math
@@ -543,10 +544,45 @@ def validar_datos_publicables(datos, profundidad=0):
 # ======================
 # CLIENTE DE LA COLA DEL BACKEND
 # ======================
+def normalizar_ipv4_publica(valor):
+    """Acepta solo una IPv4 pública canónica para la comprobación de red."""
+    try:
+        if not isinstance(valor, str):
+            raise ValueError()
+        direccion = IPv4Address(valor.strip())
+    except ValueError:
+        raise crear_error_weyland('Se requiere una IPv4 publica valida para la maquina') from None
+    if not direccion.is_global or direccion.is_multicast or direccion.is_reserved:
+        raise crear_error_weyland('La direccion de la maquina debe ser una IPv4 publica')
+    return str(direccion)
+
+
+def consultar_ipv4_publica():
+    """Consulta la IPv4 de salida con el mismo criterio de proxy que el cliente de Weyland."""
+    try:
+        with requests.Session() as sesion:
+            sesion.trust_env = False
+            with sesion.get('https://api.ipify.org', timeout=(5, 10), allow_redirects=False) as respuesta:
+                if respuesta.status_code != 200:
+                    raise crear_error_weyland('No se pudo verificar la IPv4 publica del equipo')
+                return normalizar_ipv4_publica(respuesta.text)
+    except requests.RequestException:
+        raise crear_error_weyland('No se pudo verificar la IPv4 publica del equipo') from None
+
+
 def crear_cliente_weyland(config, session=None, *, max_input_bytes=MAX_BYTES, empresa_id=None):
     """No reutiliza los POST por ID ni presupone idempotencia del servidor."""
 
-    cliente = SimpleNamespace()
+    cliente = SimpleNamespace(ipv4_esperada=None, ipv4_salida=None)
+
+    def verificar_ipv4():
+        """Verifica la red antes de cualquier toma y guarda solo la comparación de esta corrida."""
+        if config['bot_maquina_id'] is not None and cliente.ipv4_esperada is None:
+            raise crear_error_weyland('Verifica y guarda la IPv4 de la maquina antes de tomar solicitudes')
+        salida = consultar_ipv4_publica()
+        if cliente.ipv4_esperada is not None and cliente.ipv4_esperada != salida:
+            raise crear_error_weyland('La IPv4 publica del equipo no coincide con la registrada para la maquina')
+        cliente.ipv4_salida = salida
 
     def iniciar():
         """Inicia o reutiliza JWT mediante el módulo funcional."""
@@ -607,6 +643,8 @@ def crear_cliente_weyland(config, session=None, *, max_input_bytes=MAX_BYTES, em
     def tomar_siguiente(maquina_id, id_externo):
         """Toma como máximo una solicitud con la máquina y la correlación persistida."""
         id_positivo(maquina_id)
+        if cliente.ipv4_salida is None:
+            raise crear_error_weyland('Se requiere verificar la IPv4 publica antes de tomar solicitudes')
         if not isinstance(id_externo, str) or not re.fullmatch(r'[a-f0-9]{32}', id_externo):
             raise ValueError('id_externo debe ser la correlacion local persistida')
         with cliente.post(RUTA_SIGUIENTE,
@@ -627,6 +665,10 @@ def crear_cliente_weyland(config, session=None, *, max_input_bytes=MAX_BYTES, em
                 or not isinstance(datos.get('parametros'), dict)
                 or not any(k in datos for k in ('input', 'inputs'))):
             raise crear_error_weyland('Asignacion incompatible con VM, correlacion, proceso o parametros')
+        if cliente.ipv4_salida is not None:
+            asignada = normalizar_ipv4_publica(datos['maquina'].get('direccion_ip'))
+            if asignada != cliente.ipv4_salida:
+                raise crear_error_weyland('La IPv4 de la asignacion no coincide con la salida publica del equipo')
         multiples = 'inputs' in datos
         entradas = datos['inputs'] if multiples else ([datos['input']] if datos['input'] is not None else [])
         if not isinstance(entradas, list) or len(entradas) > BACKEND_MAX_INPUTS:
@@ -832,6 +874,7 @@ def crear_cliente_weyland(config, session=None, *, max_input_bytes=MAX_BYTES, em
                                MAX_BYTES, usuario=True)
 
     cliente.login = iniciar
+    cliente.verificar_ipv4 = verificar_ipv4
     cliente.refrescar = renovar
     cliente.cerrar = cerrar_cliente
     cliente.verificar = verificar_cliente
@@ -891,6 +934,19 @@ def leer_valores(archivo=None):
     return combinar_configuracion(dotenv_values(archivo), os.environ)
 
 
+def guardar_maquina_verificada(raiz, cliente, maquina_id, ipv4):
+    """Guarda solo una máquina explícita que la sesión de Weyland confirmó."""
+    maquina_id = id_positivo(maquina_id)
+    if cliente.config['bot_maquina_id'] != maquina_id or cliente.sesion._weyland['maquina_id'] != maquina_id:
+        raise crear_error_weyland('La sesion no confirma la maquina que se quiere guardar')
+    ipv4 = normalizar_ipv4_publica(ipv4)
+    if consultar_ipv4_publica() != ipv4:
+        raise crear_error_weyland('La IPv4 publica del equipo no coincide con la registrada para la maquina')
+    ruta = confinar(raiz, '.runtime/maquina_weyland.json')
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    guardar_json(ruta, {'backend': cliente.config['url'], 'maquina_id': maquina_id, 'ipv4': ipv4})
+
+
 def crear_cliente_api(archivo=None, session=None, *, maquina_id=None):
     """Exige el contrato y el modo JWT del bot antes de construir su cliente."""
     valores = leer_valores(archivo)
@@ -900,7 +956,23 @@ def crear_cliente_api(archivo=None, session=None, *, maquina_id=None):
         raise ValueError('Este bot utiliza BACKEND_AUTH_MODE=weyland')
     if valores.get('BACKEND_BOT_AUTH_MODE', 'jwt') != 'jwt':
         raise ValueError('Este backend requiere BACKEND_BOT_AUTH_MODE=jwt')
-    return crear_cliente_cola({**valores, 'BACKEND_BOT_AUTH_MODE': 'jwt'}, session=session, maquina_id=maquina_id)
+    from config.archivos import ARCHIVO_ENV
+    raiz = (Path(archivo) if archivo else ARCHIVO_ENV).parent.resolve()
+    ruta = confinar(raiz, '.runtime/maquina_weyland.json')
+    ipv4_esperada = None
+    if ruta.exists():
+        maquina_local = leer(ruta)
+        backend = str(valores.get('BACKEND_API_URL') or '').strip().rstrip('/')
+        if maquina_local.get('backend') != backend:
+            if maquina_id is None:
+                raise crear_error_weyland('La maquina guardada pertenece a otro backend; verificar la maquina actual')
+        elif maquina_id is None or maquina_local.get('maquina_id') == maquina_id:
+            maquina_id = id_positivo(maquina_local.get('maquina_id'))
+            if maquina_local.get('ipv4') is not None:
+                ipv4_esperada = normalizar_ipv4_publica(maquina_local['ipv4'])
+    cliente = crear_cliente_cola({**valores, 'BACKEND_BOT_AUTH_MODE': 'jwt'}, session=session, maquina_id=maquina_id)
+    cliente.ipv4_esperada = ipv4_esperada
+    return cliente
 
 
 # ======================
@@ -1667,6 +1739,7 @@ def ejecutar_cola_configurada(fabrica, valores, raiz, procesos, *, notificar=Non
     with sesion_cliente(cliente):
         if cliente.config['bot_auth_mode'] != 'jwt':
             raise crear_error_weyland('Se requiere autenticacion JWT antes de tomar trabajo')
+        cliente.verificar_ipv4()
         maquina = id_positivo(cliente.verificar())
         trabajos = base / 'cola_actual' / f'maquina_{maquina}'
         if revisar_trabajos is not None:

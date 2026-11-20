@@ -230,3 +230,9 @@ Al reanudar una ejecución abierta, se conserva su Queue y se omite el aviso ini
 Weyland detecta la máquina por la IP pública de salida registrada y devuelve su ID al abrir la sesión. Los checkpoints conservan sus carpetas por ID numérico. Si la IP es desconocida o está registrada en varias máquinas, el bot se detiene antes de consultar la cola.
 
 Para una sesión con el contrato que recibe el ID explícito, usa `ejecutar.bat api-verificar --maquina-id NUMERO` para verificar el acceso y `ejecutar.bat web-procesar --maquina-id NUMERO` para tomar la siguiente solicitud de esa máquina. El número se aplica solo a esa corrida. Usa el ID que muestra el portal y confirma primero el orden de la cola.
+
+### Ejecutar con doble clic
+
+Si la sesión BOT no devuelve una máquina por IP, verifica y guarda el ID localmente una sola vez con `ejecutar.bat api-verificar --maquina-id NUMERO --ipv4-publica IPV4 --guardar-maquina`. El archivo `.runtime/maquina_weyland.json` se crea después de confirmar la máquina con Weyland y queda fuera de Git. Luego abre `ejecutar.bat` con doble clic. Selecciona la siguiente solicitud elegible de esa máquina. Sin una máquina guardada, el arranque solicita identificación por IP. Un `--maquina-id` explícito conserva prioridad para esa corrida.
+
+El worker comprueba la IPv4 pública antes de tomar trabajo y compara la respuesta de Weyland con esa misma IPv4. La prueba de salida usa ipify por HTTPS sin credenciales; si no se puede verificar la red, no se toma ninguna solicitud.

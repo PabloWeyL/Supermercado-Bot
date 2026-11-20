@@ -2,6 +2,8 @@
 
 ## Sin publicar
 
+- Permite guardar una máquina y una IPv4 pública confirmadas para usar el lanzador con doble clic, sin cambiar el .env.
+
 - Permite indicar el ID de máquina para una sola corrida web cuando Weyland usa el contrato de sesión con ID explícito.
 
 - Resuelve la máquina por IP pública al abrir sesión y conserva los checkpoints por ID de máquina.

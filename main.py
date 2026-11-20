@@ -30,7 +30,7 @@ try:
     from config import configuracion, correo, base_datos
     from config.archivos import (rutas_ejecucion, bloqueo, confinar, crear_respaldo_historico,
                                 guardar_json, EXTENSIONES_EXCEL, buscar_carpeta_ejecucion_web)
-    from integraciones.weyland import crear_cliente_api, leer_valores, sesion_cliente
+    from integraciones.weyland import crear_cliente_api, guardar_maquina_verificada, leer_valores, sesion_cliente
     from integraciones.weyland import crear_proceso_bot, crear_resultado_bot, correo_permitido, ejecutar_cola_configurada
     from integraciones import supermercados, reportes
 except (ImportError, RuntimeError, ValueError, OSError) as error:
@@ -384,7 +384,9 @@ def argumentos(argv=None):
     parser.add_argument('comando', nargs='?', choices=('procesar', 'web-procesar', 'api-verificar',
         'cargar', 'estado', 'reporte', 'correos-estado', 'correos-reintentar', 'correos-resolver'))
     parser.add_argument('--productos-json', type=Path)
-    parser.add_argument('--maquina-id', type=int, help='ID de Weyland solo para esta corrida web')
+    parser.add_argument('--maquina-id', type=int, help='ID explícito de Weyland para esta corrida')
+    parser.add_argument('--guardar-maquina', action='store_true', help='Guarda la máquina tras verificarla sin tomar trabajo')
+    parser.add_argument('--ipv4-publica', help='IPv4 pública registrada para esta máquina; usada con --guardar-maquina')
     parser.add_argument('--id-correo')
     parser.add_argument('--destinatario')
     resolucion = parser.add_mutually_exclusive_group()
@@ -394,6 +396,11 @@ def argumentos(argv=None):
     if args.maquina_id is not None and (args.maquina_id < 1 or args.productos_json
             or args.comando not in (None, 'web-procesar', 'api-verificar')):
         parser.error('--maquina-id requiere un ID positivo y un comando web')
+    if args.guardar_maquina and (args.comando != 'api-verificar'
+            or args.maquina_id is None or not args.ipv4_publica):
+        parser.error('--guardar-maquina requiere api-verificar, --maquina-id y --ipv4-publica')
+    if args.ipv4_publica and not args.guardar_maquina:
+        parser.error('--ipv4-publica solo se admite con --guardar-maquina')
     if args.productos_json and args.comando not in (None, 'procesar'):
         parser.error('--productos-json solo se admite para procesar')
     if args.comando != 'correos-resolver' and (args.entregado or args.no_entregado or args.destinatario):
@@ -438,6 +445,13 @@ def main(argv=None):
                     return 0
                 with sesion_cliente(crear_cliente_api(maquina_id=args.maquina_id)) as cliente:
                     maquina = cliente.verificar()
+                    if args.guardar_maquina:
+                        guardar_maquina_verificada(configuracion.RUTA_PROYECTO, cliente, maquina, args.ipv4_publica)
+                    elif cliente.ipv4_esperada is not None:
+                        cliente.verificar_ipv4()
+                        configuracion.obtener_logger('API').info('IPV4 PÚBLICA CONFIRMADA')
+                    if args.guardar_maquina:
+                        configuracion.obtener_logger('API').info('MÁQUINA %s GUARDADA PARA ARRANQUES SIN ARGUMENTOS', maquina)
                 configuracion.obtener_logger('API').info('CONEXIÓN JWT AUTENTICADA PARA MÁQUINA %s. NO SE TOMÓ TRABAJO', maquina)
                 return 0
             if args.comando and args.comando.startswith('correos-'):
